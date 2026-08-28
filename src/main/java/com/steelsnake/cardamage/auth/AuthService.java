@@ -1,7 +1,6 @@
 package com.steelsnake.cardamage.auth;
 
 import java.util.Locale;
-import java.util.Optional;
 
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -34,8 +33,7 @@ public class AuthService {
 		}
 
 		return this.adminUserRepository.findByEmail(email.strip().toLowerCase(Locale.ROOT))
-				.map(Optional::of)
-				.defaultIfEmpty(Optional.empty())
+				.singleOptional()
 				.flatMap(admin -> passwordMatches(
 						password,
 						admin.map(AdminUser::passwordHash).orElse(DUMMY_PASSWORD_HASH))

@@ -10,11 +10,13 @@ import javax.crypto.spec.SecretKeySpec;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webflux.test.autoconfigure.WebFluxTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpHeaders;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
 import org.springframework.security.oauth2.jwt.JwtClaimsSet;
@@ -33,12 +35,10 @@ import com.steelsnake.cardamage.claim.ClaimController;
 import com.steelsnake.cardamage.claim.ClaimService;
 import com.steelsnake.cardamage.claim.ClaimStatus;
 import com.steelsnake.cardamage.claim.ClaimStatusResponse;
-import com.steelsnake.cardamage.config.SecurityConfig;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -54,7 +54,7 @@ class SecurityWebTests {
 
 	private static final String EMAIL = "admin@test.local";
 	private static final String PASSWORD = "correct-test-password";
-	private static final String ISSUER = "car-damage-api";
+	private static final String PASSWORD_HASH = new BCryptPasswordEncoder().encode(PASSWORD);
 
 	@Autowired
 	private WebTestClient webTestClient;
@@ -73,7 +73,7 @@ class SecurityWebTests {
 	@BeforeEach
 	void configureAdmin() {
 		this.admin = new AdminUser(
-				UUID.randomUUID(), EMAIL, this.passwordEncoder.encode(PASSWORD), Instant.now());
+				UUID.randomUUID(), EMAIL, PASSWORD_HASH, Instant.now());
 		when(this.adminUserRepository.findByEmail(EMAIL)).thenReturn(Mono.just(this.admin));
 	}
 
@@ -103,7 +103,7 @@ class SecurityWebTests {
 	}
 
 	@Test
-	void unknownEmailReturnsUnauthorized() {
+	void unknownEmailStillRunsCostTenBcryptCheck() {
 		String unknownEmail = "unknown@test.local";
 		when(this.adminUserRepository.findByEmail(unknownEmail)).thenReturn(Mono.empty());
 
@@ -113,7 +113,9 @@ class SecurityWebTests {
 				.exchange()
 				.expectStatus().isUnauthorized()
 				.expectBody().isEmpty();
-		verify(this.passwordEncoder, times(1)).matches(eq(PASSWORD), anyString());
+		var hash = ArgumentCaptor.forClass(String.class);
+		verify(this.passwordEncoder, times(1)).matches(eq(PASSWORD), hash.capture());
+		assertThat(hash.getValue()).matches("\\$2[aby]\\$10\\$[./0-9A-Za-z]{53}");
 	}
 
 	@Test
@@ -137,6 +139,7 @@ class SecurityWebTests {
 				.uri("/api/admin/claims")
 				.exchange()
 				.expectStatus().isUnauthorized()
+				.expectHeader().valueEquals(HttpHeaders.WWW_AUTHENTICATE, "Bearer")
 				.expectBody()
 				.jsonPath("$.status").isEqualTo(401);
 	}
@@ -155,9 +158,17 @@ class SecurityWebTests {
 	@Test
 	void expiredJwtReturnsUnauthorized() {
 		Instant now = Instant.now();
-		String token = token(this.jwtEncoder, ISSUER, now.minusSeconds(7200), now.minusSeconds(3600), true);
+		String token = token(
+				this.jwtEncoder, JwtService.ISSUER,
+				now.minusSeconds(7200), now.minusSeconds(3600), true);
 
 		expectUnauthorized(token);
+	}
+
+	@Test
+	void jwtWithoutExpirationReturnsUnauthorized() {
+		Instant now = Instant.now();
+		expectUnauthorized(token(this.jwtEncoder, JwtService.ISSUER, now, null, true));
 	}
 
 	@Test
@@ -170,7 +181,8 @@ class SecurityWebTests {
 				.build();
 		Instant now = Instant.now();
 
-		expectUnauthorized(token(otherEncoder, ISSUER, now, now.plusSeconds(3600), true));
+		expectUnauthorized(token(
+				otherEncoder, JwtService.ISSUER, now, now.plusSeconds(3600), true));
 	}
 
 	@Test
@@ -234,7 +246,7 @@ class SecurityWebTests {
 
 	private String tokenWithoutRoles() {
 		Instant now = Instant.now();
-		return token(this.jwtEncoder, ISSUER, now, now.plusSeconds(3600), false);
+		return token(this.jwtEncoder, JwtService.ISSUER, now, now.plusSeconds(3600), false);
 	}
 
 	private void expectUnauthorized(String token) {
@@ -256,8 +268,10 @@ class SecurityWebTests {
 		JwtClaimsSet.Builder claims = JwtClaimsSet.builder()
 				.issuer(issuer)
 				.subject(EMAIL)
-				.issuedAt(issuedAt)
-				.expiresAt(expiresAt);
+				.issuedAt(issuedAt);
+		if (expiresAt != null) {
+			claims.expiresAt(expiresAt);
+		}
 		if (includeAdminRole) {
 			claims.claim("roles", List.of("ADMIN"));
 		}

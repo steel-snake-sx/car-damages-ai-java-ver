@@ -4,6 +4,7 @@ import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -20,6 +21,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.codec.multipart.FilePart;
+import org.springframework.transaction.reactive.TransactionSynchronization;
 
 import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
@@ -35,17 +37,20 @@ class ImageStorageTests {
 	Path temporaryDirectory;
 
 	@Test
-	void stagesAndFinalizesValidSmallPngAndJpegUnderSafePaths() throws IOException {
+	void stagesAndMovesValidPngAndJpegUnderSafePaths() throws IOException {
 		byte[] png = createImage("png");
 		byte[] jpeg = createImage("jpg");
 		ImageStorage storage = new ImageStorage(this.temporaryDirectory.toString());
-		ImageStorage.StagedImages staged = storage.createStaging();
+		ImageStorage.ImageBatch batch = storage.createBatch();
 		UUID claimId = UUID.randomUUID();
 
-		StepVerifier.create(storage.stage(staged, List.of(
+		StepVerifier.create(storage.stage(batch, List.of(
 				filePart("../../damage.png", MediaType.IMAGE_PNG, png),
 				filePart("damage.jpg", MediaType.IMAGE_JPEG, jpeg)))
-				.then(storage.finalizeClaim(staged, claimId)))
+				.then(Mono.defer(() -> {
+					assertThat(batch.beginTransaction()).isTrue();
+					return storage.moveToClaim(batch, claimId);
+				})))
 				.assertNext(images -> {
 					assertThat(images).hasSize(2);
 					assertThat(images.get(0).storagePath()).startsWith(claimId + "/").endsWith(".png");
@@ -56,6 +61,59 @@ class ImageStorageTests {
 				})
 				.expectComplete()
 				.verify(Duration.ofSeconds(5));
+	}
+
+	@Test
+	void transactionCleanupWaitsForRegisteredMove() throws IOException {
+		ImageStorage storage = new ImageStorage(this.temporaryDirectory.toString());
+		ImageStorage.ImageBatch batch = storage.createBatch();
+		UUID claimId = UUID.randomUUID();
+
+		StepVerifier.create(storage.stage(batch, List.of(filePart(
+				"damage.png", MediaType.IMAGE_PNG, createImage("png")))))
+				.expectComplete()
+				.verify(Duration.ofSeconds(5));
+		assertThat(batch.beginTransaction()).isTrue();
+		Mono<List<ImageStorage.StoredImage>> move = storage.moveToClaim(batch, claimId);
+
+		StepVerifier.create(storage.completeTransaction(
+				batch, TransactionSynchronization.STATUS_ROLLED_BACK))
+				.expectComplete()
+				.verify(Duration.ofSeconds(5));
+		StepVerifier.create(move)
+				.assertNext(images -> assertThat(images).hasSize(1))
+				.expectComplete()
+				.verify(Duration.ofSeconds(1));
+
+		assertThat(stagingDirectory(batch)).doesNotExist();
+		assertThat(this.temporaryDirectory.resolve(claimId.toString())).doesNotExist();
+	}
+
+	@Test
+	void transactionCleanupPreventsLateMoveRegistration() throws IOException {
+		ImageStorage storage = new ImageStorage(this.temporaryDirectory.toString());
+		ImageStorage.ImageBatch batch = storage.createBatch();
+		UUID claimId = UUID.randomUUID();
+
+		StepVerifier.create(storage.stage(batch, List.of(filePart(
+				"damage.png", MediaType.IMAGE_PNG, createImage("png")))))
+				.expectComplete()
+				.verify(Duration.ofSeconds(5));
+		assertThat(batch.beginTransaction()).isTrue();
+		Mono<Void> cleanup = storage.completeTransaction(
+				batch, TransactionSynchronization.STATUS_ROLLED_BACK);
+
+		StepVerifier.create(storage.moveToClaim(batch, claimId))
+				.expectErrorSatisfies(error -> assertThat(error)
+						.isInstanceOf(IllegalStateException.class)
+						.hasMessage("Image cleanup was already claimed"))
+				.verify(Duration.ofSeconds(1));
+		StepVerifier.create(cleanup)
+				.expectComplete()
+				.verify(Duration.ofSeconds(5));
+
+		assertThat(stagingDirectory(batch)).doesNotExist();
+		assertThat(this.temporaryDirectory.resolve(claimId.toString())).doesNotExist();
 	}
 
 	@Test
@@ -76,18 +134,27 @@ class ImageStorageTests {
 	}
 
 	@Test
-	void rejectsOversizedDimensionsBeforeFullDecode() throws IOException {
+	void rejectsOversizedDimensionBeforeFullDecode() throws IOException {
+		assertOversizedDimensions(6_001, 1);
+	}
+
+	@Test
+	void rejectsOversizedPixelCountBeforeFullDecode() throws IOException {
+		assertOversizedDimensions(4_000, 2_501);
+	}
+
+	private void assertOversizedDimensions(int width, int height) throws IOException {
 		ImageStorage storage = new ImageStorage(this.temporaryDirectory.toString());
-		ImageStorage.StagedImages staged = storage.createStaging();
-		byte[] oversizedPng = createPngHeader(6_001, 2_000);
+		ImageStorage.ImageBatch batch = storage.createBatch();
+		byte[] oversizedPng = createPngHeader(width, height);
 
 		Mono<Void> operation = Mono.usingWhen(
-				Mono.just(staged),
+				Mono.just(batch),
 				resource -> storage.stage(resource, List.of(filePart(
 						"huge.png", MediaType.IMAGE_PNG, oversizedPng))),
 				resource -> Mono.empty(),
-				(resource, error) -> storage.cleanupIfUnmanaged(resource, "test failure", error),
-				resource -> storage.cleanupIfUnmanaged(resource, "test cancellation", null));
+				(resource, error) -> storage.cleanupFromRequest(resource, "test failure", error),
+				resource -> storage.cleanupFromRequest(resource, "test cancellation", null));
 
 		StepVerifier.create(operation)
 				.expectErrorSatisfies(error -> assertThat(error)
@@ -95,19 +162,19 @@ class ImageStorageTests {
 						.hasMessage("Image dimensions are too large"))
 				.verify(Duration.ofSeconds(5));
 
-		assertThat(stagingDirectory(staged)).doesNotExist();
+		assertThat(stagingDirectory(batch)).doesNotExist();
 	}
 
 	private void assertMalformedImage(String filename, MediaType contentType, byte[] content) {
 		ImageStorage storage = new ImageStorage(this.temporaryDirectory.toString());
-		ImageStorage.StagedImages staged = storage.createStaging();
+		ImageStorage.ImageBatch batch = storage.createBatch();
 
 		Mono<Void> operation = Mono.usingWhen(
-				Mono.just(staged),
+				Mono.just(batch),
 				resource -> storage.stage(resource, List.of(filePart(filename, contentType, content))),
 				resource -> Mono.empty(),
-				(resource, error) -> storage.cleanupIfUnmanaged(resource, "test failure", error),
-				resource -> storage.cleanupIfUnmanaged(resource, "test cancellation", null));
+				(resource, error) -> storage.cleanupFromRequest(resource, "test failure", error),
+				resource -> storage.cleanupFromRequest(resource, "test cancellation", null));
 
 		StepVerifier.create(operation)
 				.expectErrorSatisfies(error -> assertThat(error)
@@ -115,11 +182,11 @@ class ImageStorageTests {
 						.hasMessage("Image file is malformed"))
 				.verify(Duration.ofSeconds(5));
 
-		assertThat(stagingDirectory(staged)).doesNotExist();
+		assertThat(stagingDirectory(batch)).doesNotExist();
 	}
 
-	private Path stagingDirectory(ImageStorage.StagedImages staged) {
-		return this.temporaryDirectory.resolve(".staging").resolve(staged.stagingId().toString());
+	private Path stagingDirectory(ImageStorage.ImageBatch batch) {
+		return this.temporaryDirectory.resolve(".staging").resolve(batch.stagingId().toString());
 	}
 
 	private static byte[] createImage(String format) throws IOException {
@@ -180,7 +247,7 @@ class ImageStorageTests {
 			Files.write(destination, content);
 		}
 		catch (IOException exception) {
-			throw new RuntimeException(exception);
+			throw new UncheckedIOException(exception);
 		}
 	}
 }

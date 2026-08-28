@@ -12,11 +12,9 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.Semaphore;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 
-import javax.imageio.IIOException;
 import javax.imageio.ImageIO;
 import javax.imageio.ImageReader;
 import javax.imageio.stream.ImageInputStream;
@@ -29,6 +27,7 @@ import org.springframework.transaction.reactive.TransactionSynchronization;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
@@ -47,42 +46,47 @@ public class ImageStorage {
 		this.rootDirectory = Path.of(rootDirectory).toAbsolutePath().normalize();
 	}
 
-	StagedImages createStaging() {
-		return new StagedImages(UUID.randomUUID());
+	ImageBatch createBatch() {
+		return new ImageBatch(UUID.randomUUID());
 	}
 
-	Mono<Void> stage(StagedImages stagedImages, List<FilePart> fileParts) {
-		Path stagingDirectory = stagingDirectory(stagedImages);
+	Mono<Void> stage(ImageBatch batch, List<FilePart> fileParts) {
+		Path stagingDirectory = stagingDirectory(batch);
 
 		Mono<Void> operation = createDirectory(stagingDirectory)
-				.thenMany(reactor.core.publisher.Flux.fromIterable(fileParts)
+				.thenMany(Flux.fromIterable(fileParts)
 						.concatMap(filePart -> stageFile(stagingDirectory, filePart)))
 				.collectList()
-				.doOnNext(stagedImages::setImages)
+				.doOnNext(batch::setImages)
 				.then()
 				.cache();
-		stagedImages.trackFilesystemOperation(operation);
+		if (!batch.trackRequestFilesystemOperation(operation)) {
+			return Mono.error(new IllegalStateException("Image cleanup was already claimed"));
+		}
 		return operation;
 	}
 
-	Mono<List<StoredImage>> finalizeClaim(StagedImages stagedImages, UUID claimId) {
-		Path stagingDirectory = stagingDirectory(stagedImages);
+	Mono<List<StoredImage>> moveToClaim(ImageBatch batch, UUID claimId) {
+		Path stagingDirectory = stagingDirectory(batch);
 		Path claimDirectory = claimDirectory(claimId);
 		Mono<List<StoredImage>> operation = Mono.fromCallable(() -> {
+			if (Files.exists(claimDirectory)) {
+				throw new IllegalStateException("Image directory already exists for claim " + claimId);
+			}
 			try {
-				Files.createDirectories(this.rootDirectory);
 				try {
 					Files.move(stagingDirectory, claimDirectory, StandardCopyOption.ATOMIC_MOVE);
+					batch.setClaimId(claimId);
 				}
 				catch (AtomicMoveNotSupportedException exception) {
+					batch.setClaimId(claimId);
 					Files.move(stagingDirectory, claimDirectory);
 				}
 			}
 			catch (IOException exception) {
 				throw new UncheckedIOException(exception);
 			}
-			stagedImages.setClaimId(claimId);
-			return stagedImages.images().stream()
+			return batch.images().stream()
 					.map(image -> new StoredImage(
 							(claimId + "/" + image.storedFilename()).replace('\\', '/'),
 							image.originalFilename(),
@@ -90,46 +94,47 @@ public class ImageStorage {
 							image.sizeBytes()))
 					.toList();
 		}).subscribeOn(Schedulers.boundedElastic()).cache();
-		stagedImages.trackFilesystemOperation(operation.then());
+		if (!batch.trackTransactionFilesystemOperation(operation.then())) {
+			return Mono.error(new IllegalStateException("Image cleanup was already claimed"));
+		}
 		return operation;
 	}
 
-	Mono<Void> cleanupIfUnmanaged(StagedImages stagedImages, String reason, Throwable primaryError) {
-		return stagedImages.beginUnmanagedCleanup()
-				? cleanup(stagedImages, reason, primaryError)
+	Mono<Void> cleanupFromRequest(ImageBatch batch, String reason, Throwable primaryError) {
+		return batch.beginRequestCleanup()
+				? cleanup(batch, reason, primaryError)
 				: Mono.empty();
 	}
 
-	Mono<Void> afterTransaction(StagedImages stagedImages, int status) {
+	Mono<Void> completeTransaction(ImageBatch batch, int status) {
 		if (status == TransactionSynchronization.STATUS_COMMITTED) {
-			stagedImages.markCommitted();
+			batch.keepFiles();
 			return Mono.empty();
 		}
 		if (status == TransactionSynchronization.STATUS_UNKNOWN) {
-			stagedImages.markOutcomeUnknown();
+			batch.keepFiles();
 			logger.warn(
 					"Keeping image files for staging id {} and claim id {} because transaction outcome is unknown",
-					stagedImages.stagingId(), stagedImages.claimId());
+					batch.stagingId(), batch.claimId());
 			return Mono.empty();
 		}
-		return stagedImages.beginTransactionCleanup()
-				? cleanup(stagedImages, "transaction completed with status " + status, null)
+		return batch.beginTransactionCleanup()
+				? cleanup(batch, "transaction completed with status " + status, null)
 				: Mono.empty();
 	}
 
-	private Mono<Void> cleanup(StagedImages stagedImages, String reason, Throwable primaryError) {
-		return stagedImages.awaitFilesystemOperation()
-				.onErrorResume(error -> Mono.empty())
-				.then(Mono.fromRunnable(() -> deleteStagedAndFinalDirectories(stagedImages)))
-				.subscribeOn(Schedulers.boundedElastic())
-				.then()
+	private Mono<Void> cleanup(ImageBatch batch, String reason, Throwable primaryError) {
+		return batch.awaitFilesystemOperation()
+				.onErrorComplete()
+				.then(Mono.<Void>fromRunnable(() -> deleteStagedAndFinalDirectories(batch))
+						.subscribeOn(Schedulers.boundedElastic()))
 				.onErrorResume(cleanupError -> {
 					if (primaryError != null) {
 						primaryError.addSuppressed(cleanupError);
 					}
 					logger.error(
 							"Failed to clean image files for staging id {} and claim id {} after {}",
-							stagedImages.stagingId(), stagedImages.claimId(), reason, cleanupError);
+							batch.stagingId(), batch.claimId(), reason, cleanupError);
 					return Mono.empty();
 				});
 	}
@@ -144,19 +149,18 @@ public class ImageStorage {
 	}
 
 	private Mono<Void> createDirectory(Path directory) {
-		return Mono.fromRunnable(() -> {
+		return Mono.<Void>fromRunnable(() -> {
 			try {
 				Files.createDirectories(directory);
 			}
 			catch (IOException exception) {
 				throw new UncheckedIOException(exception);
 			}
-		}).subscribeOn(Schedulers.boundedElastic()).then();
+		}).subscribeOn(Schedulers.boundedElastic());
 	}
 
 	private Mono<Void> transfer(FilePart filePart, Path destination) {
-		return Mono.defer(() -> filePart.transferTo(destination))
-				.subscribeOn(Schedulers.boundedElastic());
+		return filePart.transferTo(destination).subscribeOn(Schedulers.boundedElastic());
 	}
 
 	private Mono<StagedImage> inspectStoredFile(
@@ -182,28 +186,26 @@ public class ImageStorage {
 	}
 
 	private void validateImageWithPermit(Path path, ImageType expectedType) throws IOException {
-		boolean acquired = false;
 		try {
 			this.imageValidationPermit.acquire();
-			acquired = true;
-			validateImage(path, expectedType);
 		}
 		catch (InterruptedException exception) {
 			Thread.currentThread().interrupt();
 			throw new IllegalStateException("Image validation was interrupted", exception);
 		}
+		try {
+			validateImage(path, expectedType);
+		}
 		finally {
-			if (acquired) {
-				this.imageValidationPermit.release();
-			}
+			this.imageValidationPermit.release();
 		}
 	}
 
-	private void deleteStagedAndFinalDirectories(StagedImages stagedImages) {
+	private void deleteStagedAndFinalDirectories(ImageBatch batch) {
 		List<RuntimeException> failures = new ArrayList<>();
-		deleteRecursively(stagingDirectory(stagedImages), failures);
-		if (stagedImages.claimId() != null) {
-			deleteRecursively(claimDirectory(stagedImages.claimId()), failures);
+		deleteRecursively(stagingDirectory(batch), failures);
+		if (batch.claimId() != null) {
+			deleteRecursively(claimDirectory(batch.claimId()), failures);
 		}
 		if (!failures.isEmpty()) {
 			RuntimeException failure = failures.getFirst();
@@ -234,20 +236,12 @@ public class ImageStorage {
 		}
 	}
 
-	private Path stagingDirectory(StagedImages stagedImages) {
-		return resolveWithinRoot(".staging/" + stagedImages.stagingId());
+	private Path stagingDirectory(ImageBatch batch) {
+		return this.rootDirectory.resolve(".staging").resolve(batch.stagingId().toString());
 	}
 
 	private Path claimDirectory(UUID claimId) {
-		return resolveWithinRoot(claimId.toString());
-	}
-
-	private Path resolveWithinRoot(String relativePath) {
-		Path resolved = this.rootDirectory.resolve(relativePath).normalize();
-		if (!resolved.startsWith(this.rootDirectory)) {
-			throw new IllegalArgumentException("Storage path escapes the configured image directory");
-		}
-		return resolved;
+		return this.rootDirectory.resolve(claimId.toString());
 	}
 
 	private static ImageType supportedImageType(FilePart filePart) {
@@ -293,7 +287,7 @@ public class ImageStorage {
 					throw ClaimApiException.badRequest("Image file is malformed");
 				}
 			}
-			catch (IIOException | IllegalArgumentException exception) {
+			catch (IOException | IllegalArgumentException | IndexOutOfBoundsException exception) {
 				throw ClaimApiException.badRequest("Image file is malformed");
 			}
 			finally {
@@ -312,7 +306,10 @@ public class ImageStorage {
 		if (safeName.isEmpty()) {
 			safeName = "image";
 		}
-		return safeName.length() <= 255 ? safeName : safeName.substring(0, 255);
+		if (safeName.codePointCount(0, safeName.length()) > 255) {
+			safeName = safeName.substring(0, safeName.offsetByCodePoints(0, 255));
+		}
+		return safeName;
 	}
 
 	record StoredImage(String storagePath, String originalFilename, String contentType, long sizeBytes) {
@@ -321,21 +318,17 @@ public class ImageStorage {
 	private record StagedImage(String storedFilename, String originalFilename, String contentType, long sizeBytes) {
 	}
 
-	static final class StagedImages {
-
-		private static final int UNMANAGED = 0;
-		private static final int TRANSACTION_MANAGED = 1;
-		private static final int CLEANUP_STARTED = 2;
-		private static final int COMMITTED = 3;
-		private static final int OUTCOME_UNKNOWN = 4;
+	static final class ImageBatch {
 
 		private final UUID stagingId;
-		private final AtomicInteger state = new AtomicInteger(UNMANAGED);
+		// State and operation share this monitor so cleanup cannot miss newly registered work.
+		private State state = State.REQUEST;
 		private volatile List<StagedImage> images = List.of();
 		private volatile UUID claimId;
-		private volatile Mono<Void> filesystemOperation = Mono.empty();
+		// Cached filesystem work survives cancellation so cleanup can join it before deleting.
+		private Mono<Void> filesystemOperation = Mono.empty();
 
-		StagedImages(UUID stagingId) {
+		ImageBatch(UUID stagingId) {
 			this.stagingId = stagingId;
 		}
 
@@ -359,32 +352,55 @@ public class ImageStorage {
 			this.claimId = claimId;
 		}
 
-		void trackFilesystemOperation(Mono<Void> operation) {
-			this.filesystemOperation = operation;
+		boolean trackRequestFilesystemOperation(Mono<Void> operation) {
+			return trackFilesystemOperation(State.REQUEST, operation);
 		}
 
-		Mono<Void> awaitFilesystemOperation() {
+		boolean trackTransactionFilesystemOperation(Mono<Void> operation) {
+			return trackFilesystemOperation(State.TRANSACTION, operation);
+		}
+
+		synchronized Mono<Void> awaitFilesystemOperation() {
 			return this.filesystemOperation;
 		}
 
-		boolean markTransactionManaged() {
-			return this.state.compareAndSet(UNMANAGED, TRANSACTION_MANAGED);
+		synchronized boolean beginTransaction() {
+			return transition(State.REQUEST, State.TRANSACTION);
 		}
 
-		boolean beginUnmanagedCleanup() {
-			return this.state.compareAndSet(UNMANAGED, CLEANUP_STARTED);
+		synchronized boolean beginRequestCleanup() {
+			return transition(State.REQUEST, State.CLEANING);
 		}
 
-		boolean beginTransactionCleanup() {
-			return this.state.compareAndSet(TRANSACTION_MANAGED, CLEANUP_STARTED);
+		synchronized boolean beginTransactionCleanup() {
+			return transition(State.TRANSACTION, State.CLEANING);
 		}
 
-		void markCommitted() {
-			this.state.compareAndSet(TRANSACTION_MANAGED, COMMITTED);
+		synchronized void keepFiles() {
+			transition(State.TRANSACTION, State.KEPT);
 		}
 
-		void markOutcomeUnknown() {
-			this.state.compareAndSet(TRANSACTION_MANAGED, OUTCOME_UNKNOWN);
+		private synchronized boolean trackFilesystemOperation(State expectedState, Mono<Void> operation) {
+			if (this.state != expectedState) {
+				return false;
+			}
+			this.filesystemOperation = operation;
+			return true;
+		}
+
+		private boolean transition(State expectedState, State nextState) {
+			if (this.state != expectedState) {
+				return false;
+			}
+			this.state = nextState;
+			return true;
+		}
+
+		private enum State {
+			REQUEST,
+			TRANSACTION,
+			CLEANING,
+			KEPT
 		}
 	}
 

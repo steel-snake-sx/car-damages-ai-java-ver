@@ -3,10 +3,12 @@ package com.steelsnake.cardamage.claim;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -27,7 +29,6 @@ import org.springframework.transaction.reactive.GenericReactiveTransaction;
 import org.springframework.transaction.reactive.TransactionSynchronizationManager;
 import org.springframework.transaction.reactive.TransactionalOperator;
 
-import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Sinks;
 import reactor.test.StepVerifier;
@@ -66,7 +67,7 @@ class ClaimServiceTests {
 		UUID claimId = configureSuccessfulPersistence();
 
 		StepVerifier.create(this.service.createClaim(
-				" Toyota ", " Camry ", 2022, Flux.just(filePart(createPng()))))
+				" Toyota ", " Camry ", 2022, List.of(filePart(createPng()))))
 				.assertNext(response -> {
 					assertThat(response.id()).isEqualTo(claimId);
 					assertThat(response.status()).isEqualTo(ClaimStatus.ANALYSIS_PENDING);
@@ -88,7 +89,7 @@ class ClaimServiceTests {
 				.thenReturn(Mono.error(new IllegalStateException("database error")));
 
 		StepVerifier.create(this.service.createClaim(
-				"Toyota", "Camry", 2022, Flux.just(filePart(createPng()))))
+				"Toyota", "Camry", 2022, List.of(filePart(createPng()))))
 				.expectErrorMessage("database error")
 				.verify(Duration.ofSeconds(5));
 
@@ -98,12 +99,12 @@ class ClaimServiceTests {
 	}
 
 	@Test
-	void commitFailureRemovesFinalizedFilesWithoutReplacingPrimaryError() throws IOException {
+	void failedCommitRemovesFinalizedFiles() throws IOException {
 		UUID claimId = configureSuccessfulPersistence();
 		this.transactionManager.commitFailure = new IllegalStateException("commit error");
 
 		StepVerifier.create(this.service.createClaim(
-				"Toyota", "Camry", 2022, Flux.just(filePart(createPng()))))
+				"Toyota", "Camry", 2022, List.of(filePart(createPng()))))
 				.expectErrorSatisfies(error -> assertThat(error).hasMessageContaining("commit error"))
 				.verify(Duration.ofSeconds(5));
 
@@ -112,12 +113,12 @@ class ClaimServiceTests {
 	}
 
 	@Test
-	void indeterminateCommitFailureKeepsFilesToAvoidDanglingMetadata() throws IOException {
+	void unknownCommitOutcomeKeepsFiles() throws IOException {
 		UUID claimId = configureSuccessfulPersistence();
 		this.transactionManager.commitFailure = new TransactionSystemException("commit outcome unknown");
 
 		StepVerifier.create(this.service.createClaim(
-				"Toyota", "Camry", 2022, Flux.just(filePart(createPng()))))
+				"Toyota", "Camry", 2022, List.of(filePart(createPng()))))
 				.expectErrorSatisfies(error -> assertThat(error).hasMessageContaining("commit outcome unknown"))
 				.verify(Duration.ofSeconds(5));
 
@@ -131,8 +132,8 @@ class ClaimServiceTests {
 		this.transactionManager.beginNeverCompletes = true;
 
 		StepVerifier.create(this.service.createClaim(
-				"Toyota", "Camry", 2022, Flux.just(filePart(createPng()))))
-				.thenAwait(Duration.ofMillis(100))
+				"Toyota", "Camry", 2022, List.of(filePart(createPng()))))
+				.then(() -> assertThat(await(this.transactionManager.beginStarted)).isTrue())
 				.thenCancel()
 				.verify(Duration.ofSeconds(5));
 
@@ -146,13 +147,15 @@ class ClaimServiceTests {
 		this.transactionManager.delayCommit = true;
 
 		StepVerifier.create(this.service.createClaim(
-				"Toyota", "Camry", 2022, Flux.just(filePart(createPng()))))
+				"Toyota", "Camry", 2022, List.of(filePart(createPng()))))
 				.then(() -> assertThat(await(this.transactionManager.commitStarted)).isTrue())
 				.thenCancel()
 				.verify(Duration.ofSeconds(10));
 
 		this.transactionManager.completeCommit();
 		assertThat(this.transactionManager.commitFinished.await(5, TimeUnit.SECONDS)).isTrue();
+		assertThat(this.transactionManager.commitCompleted).isTrue();
+		assertThat(this.transactionManager.rollbacks).isZero();
 		assertThat(this.temporaryDirectory.resolve(claimId.toString())).isDirectory();
 		assertStagingIsEmpty();
 		verify(this.imageRepository).save(any(ClaimImage.class));
@@ -174,7 +177,7 @@ class ClaimServiceTests {
 
 	@Test
 	void rejectsClaimWithoutImagesBeforePersistence() {
-		StepVerifier.create(this.service.createClaim("Toyota", "Camry", 2022, Flux.empty()))
+		StepVerifier.create(this.service.createClaim("Toyota", "Camry", 2022, List.of()))
 				.expectErrorSatisfies(error -> assertThat(error)
 						.isInstanceOf(ClaimApiException.class)
 						.hasMessage("Between 1 and 3 images are required"))
@@ -185,7 +188,7 @@ class ClaimServiceTests {
 
 	@Test
 	void rejectsMoreThanThreeImagesBeforePersistence() {
-		Flux<FilePart> images = Flux.just(
+		var images = List.of(
 				mock(FilePart.class), mock(FilePart.class), mock(FilePart.class), mock(FilePart.class));
 
 		StepVerifier.create(this.service.createClaim("Toyota", "Camry", 2022, images))
@@ -260,7 +263,7 @@ class ClaimServiceTests {
 				Files.write(invocation.getArgument(0), content);
 			}
 			catch (IOException exception) {
-				throw new RuntimeException(exception);
+				throw new UncheckedIOException(exception);
 			}
 		}));
 		return filePart;
@@ -290,11 +293,13 @@ class ClaimServiceTests {
 
 		private final CountDownLatch commitStarted = new CountDownLatch(1);
 		private final CountDownLatch commitFinished = new CountDownLatch(1);
+		private final CountDownLatch beginStarted = new CountDownLatch(1);
 		private final Sinks.Empty<Void> commitGate = Sinks.empty();
 		private int commits;
 		private int rollbacks;
 		private boolean beginNeverCompletes;
 		private boolean delayCommit;
+		private boolean commitCompleted;
 		private RuntimeException commitFailure;
 
 		@Override
@@ -307,6 +312,7 @@ class ClaimServiceTests {
 				TransactionSynchronizationManager manager,
 				Object transaction,
 				TransactionDefinition definition) throws TransactionException {
+			this.beginStarted.countDown();
 			return this.beginNeverCompletes ? Mono.never() : Mono.empty();
 		}
 
@@ -320,8 +326,8 @@ class ClaimServiceTests {
 				return Mono.error(this.commitFailure);
 			}
 			return this.delayCommit
-					? this.commitGate.asMono().doFinally(signal -> this.commitFinished.countDown())
-					: Mono.fromRunnable(this.commitFinished::countDown);
+					? this.commitGate.asMono().doOnSuccess(unused -> markCommitCompleted())
+					: Mono.fromRunnable(this::markCommitCompleted);
 		}
 
 		@Override
@@ -333,7 +339,12 @@ class ClaimServiceTests {
 		}
 
 		void completeCommit() {
-			this.commitGate.tryEmitEmpty();
+			assertThat(this.commitGate.tryEmitEmpty()).isEqualTo(Sinks.EmitResult.OK);
+		}
+
+		private void markCommitCompleted() {
+			this.commitCompleted = true;
+			this.commitFinished.countDown();
 		}
 	}
 }

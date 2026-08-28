@@ -15,6 +15,8 @@ import org.springframework.stereotype.Service;
 @Service
 public class JwtService {
 
+	static final String ISSUER = "car-damage-api";
+
 	private final JwtEncoder jwtEncoder;
 	private final Duration expiration;
 
@@ -26,7 +28,7 @@ public class JwtService {
 	LoginResponse createToken(AdminUser admin) {
 		Instant issuedAt = Instant.now();
 		JwtClaimsSet claims = JwtClaimsSet.builder()
-				.issuer("car-damage-api")
+				.issuer(ISSUER)
 				.subject(admin.email())
 				.issuedAt(issuedAt)
 				.expiresAt(issuedAt.plus(this.expiration))

@@ -18,7 +18,6 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 @RestController
@@ -34,20 +33,17 @@ public class ClaimController {
 	}
 
 	@PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-	public Mono<ResponseEntity<ClaimCreatedResponse>> createClaim(
+	public Mono<ResponseEntity<ClaimStatusResponse>> createClaim(
 			@RequestBody Mono<MultiValueMap<String, Part>> multipartBody) {
 		return multipartBody.flatMap(parts -> {
 			validatePartNames(parts);
-			FormFieldPart carBrand = requiredFormField(parts, "carBrand");
-			FormFieldPart carModel = requiredFormField(parts, "carModel");
-			FormFieldPart carYear = requiredFormField(parts, "carYear");
-			List<FilePart> images = requiredFiles(parts, "images");
+			String brand = requiredFormField(parts, "carBrand").value();
+			String model = requiredFormField(parts, "carModel").value();
+			String year = requiredFormField(parts, "carYear").value();
+			List<FilePart> images = requiredImages(parts);
 
 			return this.claimService.createClaim(
-					carBrand.value(),
-					carModel.value(),
-					parseCarYear(carYear.value()),
-					Flux.fromIterable(images));
+					brand, model, parseCarYear(year), images);
 		})
 				.map(response -> ResponseEntity
 						.created(URI.create("/api/claims/" + response.id() + "/status"))
@@ -60,12 +56,11 @@ public class ClaimController {
 	}
 
 	private static void validatePartNames(MultiValueMap<String, Part> parts) {
-		parts.keySet().stream()
-				.filter(name -> !EXPECTED_PARTS.contains(name))
-				.findFirst()
-				.ifPresent(name -> {
-					throw ClaimApiException.badRequest("Unexpected multipart part: " + name);
-				});
+		for (String name : parts.keySet()) {
+			if (!EXPECTED_PARTS.contains(name)) {
+				throw ClaimApiException.badRequest("Unexpected multipart part: " + name);
+			}
+		}
 	}
 
 	private static FormFieldPart requiredFormField(MultiValueMap<String, Part> parts, String name) {
@@ -82,15 +77,15 @@ public class ClaimController {
 		return formField;
 	}
 
-	private static List<FilePart> requiredFiles(MultiValueMap<String, Part> parts, String name) {
-		List<Part> values = parts.get(name);
+	private static List<FilePart> requiredImages(MultiValueMap<String, Part> parts) {
+		List<Part> values = parts.get("images");
 		if (values == null || values.isEmpty()) {
 			throw ClaimApiException.badRequest("Between 1 and 3 images are required");
 		}
 		return values.stream()
 				.map(part -> {
 					if (!(part instanceof FilePart filePart)) {
-						throw ClaimApiException.badRequest(name + " must contain files");
+						throw ClaimApiException.badRequest("images must contain files");
 					}
 					return filePart;
 				})

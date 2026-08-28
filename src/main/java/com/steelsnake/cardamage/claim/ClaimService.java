@@ -17,7 +17,7 @@ import reactor.core.publisher.Mono;
 @Service
 public class ClaimService {
 
-	private static final int FIRST_PRODUCTION_CAR_YEAR = 1886;
+	private static final int MIN_CAR_YEAR = 1886;
 
 	private final ClaimRepository claimRepository;
 	private final ClaimImageRepository claimImageRepository;
@@ -35,17 +35,25 @@ public class ClaimService {
 		this.transactionalOperator = transactionalOperator;
 	}
 
-	public Mono<ClaimCreatedResponse> createClaim(
-			String carBrand,
-			String carModel,
-			int carYear,
-			Flux<FilePart> images) {
-		String normalizedBrand = validateVehicleText("carBrand", carBrand);
-		String normalizedModel = validateVehicleText("carModel", carModel);
-		validateCarYear(carYear);
+	public Mono<ClaimStatusResponse> createClaim(
+			String brand, String model, int year, List<FilePart> images) {
+		String cleanBrand = validateVehicleText("carBrand", brand);
+		String cleanModel = validateVehicleText("carModel", model);
+		validateCarYear(year);
 
-		return images.collectList()
-				.flatMap(imageParts -> createClaim(normalizedBrand, normalizedModel, carYear, imageParts));
+		if (images.isEmpty() || images.size() > 3) {
+			return Mono.error(ClaimApiException.badRequest("Between 1 and 3 images are required"));
+		}
+
+		return Mono.usingWhen(
+				Mono.fromSupplier(this.imageStorage::createBatch),
+				batch -> this.imageStorage.stage(batch, images)
+						.then(Mono.defer(() -> saveClaim(cleanBrand, cleanModel, year, batch))),
+				batch -> Mono.empty(),
+				(batch, error) -> this.imageStorage.cleanupFromRequest(
+						batch, "claim creation failed", error),
+				batch -> this.imageStorage.cleanupFromRequest(
+						batch, "claim creation was cancelled", null));
 	}
 
 	public Mono<ClaimStatusResponse> getStatus(UUID claimId) {
@@ -65,68 +73,45 @@ public class ClaimService {
 				.switchIfEmpty(Mono.error(ClaimApiException.notFound()));
 	}
 
-	private Mono<ClaimCreatedResponse> createClaim(
-			String carBrand,
-			String carModel,
-			int carYear,
-			List<FilePart> images) {
-		if (images.isEmpty() || images.size() > 3) {
-			return Mono.error(ClaimApiException.badRequest("Between 1 and 3 images are required"));
-		}
-
-		return Mono.usingWhen(
-				Mono.fromSupplier(this.imageStorage::createStaging),
-				stagedImages -> this.imageStorage.stage(stagedImages, images)
-						.then(persistClaim(carBrand, carModel, carYear, stagedImages)),
-				stagedImages -> Mono.empty(),
-				(stagedImages, error) -> this.imageStorage.cleanupIfUnmanaged(
-						stagedImages, "claim creation failed", error),
-				stagedImages -> this.imageStorage.cleanupIfUnmanaged(
-						stagedImages, "claim creation was cancelled", null));
-	}
-
-	private Mono<ClaimCreatedResponse> persistClaim(
-			String carBrand,
-			String carModel,
-			int carYear,
-			ImageStorage.StagedImages stagedImages) {
+	private Mono<ClaimStatusResponse> saveClaim(
+			String brand, String model, int year, ImageStorage.ImageBatch batch) {
 		Instant now = Instant.now();
-		Claim claim = new Claim(null, carBrand, carModel, carYear, ClaimStatus.ANALYSIS_PENDING, now, now);
+		Claim claim = new Claim(null, brand, model, year, ClaimStatus.ANALYSIS_PENDING, now, now);
 
-		return this.transactionalOperator.execute(transaction -> registerCleanupSynchronization(stagedImages)
+		Mono<ClaimStatusResponse> save = registerImageCleanup(batch)
 				.then(this.claimRepository.save(claim))
-				.flatMap(savedClaim -> this.imageStorage.finalizeClaim(stagedImages, savedClaim.id())
-						.flatMap(storedImages -> saveImageMetadata(savedClaim, storedImages)
-								.thenReturn(new ClaimCreatedResponse(savedClaim.id(), savedClaim.status())))))
-				.single();
+				.flatMap(saved -> this.imageStorage.moveToClaim(batch, saved.id())
+						.flatMap(images -> saveImages(saved, images)
+								.thenReturn(new ClaimStatusResponse(saved.id(), saved.status()))));
+		return this.transactionalOperator.transactional(save);
 	}
 
-	private Mono<Void> registerCleanupSynchronization(ImageStorage.StagedImages stagedImages) {
+	private Mono<Void> registerImageCleanup(ImageStorage.ImageBatch batch) {
 		return TransactionSynchronizationManager.forCurrentTransaction()
 				.flatMap(manager -> {
 					manager.registerSynchronization(new TransactionSynchronization() {
 						@Override
 						public Mono<Void> afterCompletion(int status) {
-							return imageStorage.afterTransaction(stagedImages, status);
+							return imageStorage.completeTransaction(batch, status);
 						}
 					});
-					if (!stagedImages.markTransactionManaged()) {
-						return Mono.error(new IllegalStateException("Staged images were already released"));
+					if (!batch.beginTransaction()) {
+						return Mono.error(new IllegalStateException("Image cleanup was already claimed"));
 					}
 					return Mono.empty();
 				});
 	}
 
-	private Mono<Void> saveImageMetadata(Claim claim, List<ImageStorage.StoredImage> storedImages) {
-		return Flux.fromIterable(storedImages)
-				.concatMap(stored -> this.claimImageRepository.save(new ClaimImage(
+	private Mono<Void> saveImages(Claim claim, List<ImageStorage.StoredImage> images) {
+		return Flux.fromIterable(images)
+				.concatMap(image -> this.claimImageRepository.save(new ClaimImage(
 								null,
 								claim.id(),
-								stored.storagePath(),
-								stored.originalFilename(),
-								stored.contentType(),
-								stored.sizeBytes(),
-								Instant.now())))
+								image.storagePath(),
+								image.originalFilename(),
+								image.contentType(),
+								image.sizeBytes(),
+								claim.createdAt())))
 				.then();
 	}
 
@@ -146,10 +131,10 @@ public class ClaimService {
 	}
 
 	private static void validateCarYear(int carYear) {
-		int latestAllowedYear = Year.now().getValue() + 1;
-		if (carYear < FIRST_PRODUCTION_CAR_YEAR || carYear > latestAllowedYear) {
+		int maxYear = Year.now().getValue() + 1;
+		if (carYear < MIN_CAR_YEAR || carYear > maxYear) {
 			throw ClaimApiException.badRequest(
-					"carYear must be between " + FIRST_PRODUCTION_CAR_YEAR + " and " + latestAllowedYear);
+					"carYear must be between " + MIN_CAR_YEAR + " and " + maxYear);
 		}
 	}
 }

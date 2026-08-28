@@ -30,14 +30,14 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.reactive.server.WebTestClient;
 import org.springframework.web.reactive.function.BodyInserters;
 
+import com.steelsnake.cardamage.auth.AdminUserRepository;
 import com.steelsnake.cardamage.claim.Claim;
-import com.steelsnake.cardamage.claim.ClaimCreatedResponse;
 import com.steelsnake.cardamage.claim.ClaimImage;
 import com.steelsnake.cardamage.claim.ClaimImageRepository;
 import com.steelsnake.cardamage.claim.ClaimRepository;
 import com.steelsnake.cardamage.claim.ClaimStatus;
+import com.steelsnake.cardamage.claim.ClaimStatusResponse;
 import com.steelsnake.cardamage.claim.ImageStorage;
-import com.steelsnake.cardamage.auth.AdminUserRepository;
 import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
@@ -87,7 +87,7 @@ class CarDamageApplicationTests {
 	}
 
 	@Test
-	void migrationsRunAndRepositoriesPersistCoreData() {
+	void repositoriesPersistClaimsAndImages() {
 		Instant now = Instant.now();
 		Claim newClaim = new Claim(null, "Toyota", "Camry", 2022, ClaimStatus.ANALYSIS_PENDING, now, now);
 
@@ -130,7 +130,7 @@ class CarDamageApplicationTests {
 	}
 
 	@Test
-	void claimsApiPersistsValidMultipartRequestAndExposesOnlyStatusPublicly() throws IOException {
+	void claimSubmissionPersistsImagesAndExposesOnlyPublicStatus() throws IOException {
 		byte[] png = createPng();
 		MultipartBodyBuilder body = new MultipartBodyBuilder();
 		body.part("carBrand", "Toyota");
@@ -143,14 +143,14 @@ class CarDamageApplicationTests {
 			}
 		}).contentType(MediaType.IMAGE_PNG);
 
-		ClaimCreatedResponse created = this.webTestClient.post()
+		ClaimStatusResponse created = this.webTestClient.post()
 				.uri("/api/claims")
 				.contentType(MediaType.MULTIPART_FORM_DATA)
 				.body(BodyInserters.fromMultipartData(body.build()))
 				.exchange()
 				.expectStatus().isCreated()
 				.expectHeader().valueMatches("Location", "/api/claims/.+/status")
-				.expectBody(ClaimCreatedResponse.class)
+				.expectBody(ClaimStatusResponse.class)
 				.returnResult()
 				.getResponseBody();
 
@@ -181,7 +181,7 @@ class CarDamageApplicationTests {
 	}
 
 	@Test
-	void invalidLaterImageRollsBackDatabaseAndRemovesStoredFiles() throws IOException {
+	void invalidLaterImageLeavesDatabaseAndStorageUnchanged() throws IOException {
 		long claimsBefore = this.claimRepository.count().block(Duration.ofSeconds(10));
 		long imagesBefore = this.claimImageRepository.count().block(Duration.ofSeconds(10));
 		long directoriesBefore = countImageDirectories();
@@ -211,11 +211,12 @@ class CarDamageApplicationTests {
 				.expectComplete()
 				.verify(Duration.ofSeconds(10));
 		assertThat(countImageDirectories()).isEqualTo(directoriesBefore);
+		assertStagingIsEmpty();
 	}
 
 	@Test
-	void moreThanSixMultipartPartsIsRejectedByTheActiveHttpReader() throws IOException {
-		MultipartBodyBuilder body = validClaimBody();
+	void multipartPartLimitReturnsPayloadTooLarge() throws IOException {
+		MultipartBodyBuilder body = vehicleParts();
 		byte[] png = createPng();
 		for (int image = 0; image < 4; image++) {
 			body.part("images", imageResource("damage-" + image + ".png", png))
@@ -233,8 +234,8 @@ class CarDamageApplicationTests {
 	}
 
 	@Test
-	void oversizedImagePartIsRejectedByTheActiveHttpReader() {
-		MultipartBodyBuilder body = validClaimBody();
+	void multipartSizeLimitReturnsPayloadTooLarge() {
+		MultipartBodyBuilder body = vehicleParts();
 		body.part("images", imageResource(
 				"oversized.png", new byte[(int) ImageStorage.MAX_IMAGE_SIZE_BYTES + 1]))
 				.contentType(MediaType.IMAGE_PNG);
@@ -265,16 +266,16 @@ class CarDamageApplicationTests {
 		fileBrand.part("images", imageResource("damage.png", createPng())).contentType(MediaType.IMAGE_PNG);
 		postMultipart(fileBrand).expectStatus().isBadRequest();
 
-		MultipartBodyBuilder formFieldImage = validClaimBody();
+		MultipartBodyBuilder formFieldImage = vehicleParts();
 		formFieldImage.part("images", "not-a-file");
 		postMultipart(formFieldImage).expectStatus().isBadRequest();
 
-		MultipartBodyBuilder unexpected = validClaimBody();
+		MultipartBodyBuilder unexpected = vehicleParts();
 		unexpected.part("notes", "unexpected");
 		unexpected.part("images", imageResource("damage.png", createPng())).contentType(MediaType.IMAGE_PNG);
 		postMultipart(unexpected).expectStatus().isBadRequest();
 
-		MultipartBodyBuilder duplicateBrand = validClaimBody();
+		MultipartBodyBuilder duplicateBrand = vehicleParts();
 		duplicateBrand.part("carBrand", "Honda");
 		duplicateBrand.part("images", imageResource("damage.png", createPng())).contentType(MediaType.IMAGE_PNG);
 		postMultipart(duplicateBrand).expectStatus().isBadRequest();
@@ -310,7 +311,7 @@ class CarDamageApplicationTests {
 				.exchange();
 	}
 
-	private static MultipartBodyBuilder validClaimBody() {
+	private static MultipartBodyBuilder vehicleParts() {
 		MultipartBodyBuilder body = new MultipartBodyBuilder();
 		body.part("carBrand", "Toyota");
 		body.part("carModel", "Camry");
@@ -344,6 +345,15 @@ class CarDamageApplicationTests {
 			return paths.filter(Files::isDirectory)
 					.filter(path -> !path.getFileName().toString().equals(".staging"))
 					.count();
+		}
+	}
+
+	private static void assertStagingIsEmpty() throws IOException {
+		Path staging = imageDirectory.resolve(".staging");
+		if (Files.exists(staging)) {
+			try (var paths = Files.list(staging)) {
+				assertThat(paths).isEmpty();
+			}
 		}
 	}
 

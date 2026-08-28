@@ -13,21 +13,12 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 class ClaimExceptionHandler {
 
 	@ExceptionHandler(ClaimApiException.class)
-	ResponseEntity<ApiError> handleClaimApiException(ClaimApiException exception) {
+	ResponseEntity<ApiError> handleClaimError(ClaimApiException exception) {
 		return errorResponse(exception.status(), exception.getMessage());
 	}
 
-	@ExceptionHandler(DataBufferLimitException.class)
-	ResponseEntity<ApiError> handleMultipartSizeLimit(DataBufferLimitException exception) {
-		return errorResponse(HttpStatus.CONTENT_TOO_LARGE, "Multipart request exceeds configured limits");
-	}
-
-	@ExceptionHandler(DecodingException.class)
-	ResponseEntity<ApiError> handleMultipartDecoding(DecodingException exception) {
-		return multipartError(exception);
-	}
-
-	private static ResponseEntity<ApiError> multipartError(Throwable exception) {
+	@ExceptionHandler({DataBufferLimitException.class, DecodingException.class})
+	ResponseEntity<ApiError> handleMultipart(Throwable exception) {
 		if (isMultipartLimit(exception)) {
 			return errorResponse(HttpStatus.CONTENT_TOO_LARGE, "Multipart request exceeds configured limits");
 		}
