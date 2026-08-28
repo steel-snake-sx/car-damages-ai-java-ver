@@ -3,6 +3,7 @@ package com.steelsnake.cardamage.claim;
 import java.time.Instant;
 import java.time.Year;
 import java.util.List;
+import java.util.UUID;
 
 import org.springframework.http.codec.multipart.FilePart;
 import org.springframework.stereotype.Service;
@@ -47,9 +48,20 @@ public class ClaimService {
 				.flatMap(imageParts -> createClaim(normalizedBrand, normalizedModel, carYear, imageParts));
 	}
 
-	public Mono<ClaimStatusResponse> getStatus(java.util.UUID claimId) {
+	public Mono<ClaimStatusResponse> getStatus(UUID claimId) {
 		return this.claimRepository.findById(claimId)
 				.map(claim -> new ClaimStatusResponse(claim.id(), claim.status()))
+				.switchIfEmpty(Mono.error(ClaimApiException.notFound()));
+	}
+
+	public Flux<AdminClaimSummary> getAdminClaims() {
+		return this.claimRepository.findAllByOrderByCreatedAtDesc()
+				.map(AdminClaimSummary::from);
+	}
+
+	public Mono<AdminClaimDetails> getAdminClaim(UUID claimId) {
+		return this.claimRepository.findById(claimId)
+				.map(AdminClaimDetails::from)
 				.switchIfEmpty(Mono.error(ClaimApiException.notFound()));
 	}
 

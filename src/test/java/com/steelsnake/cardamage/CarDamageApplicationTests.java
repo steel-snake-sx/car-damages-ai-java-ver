@@ -24,6 +24,7 @@ import org.springframework.context.ApplicationContext;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.MultipartBodyBuilder;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.reactive.server.WebTestClient;
@@ -36,6 +37,7 @@ import com.steelsnake.cardamage.claim.ClaimImageRepository;
 import com.steelsnake.cardamage.claim.ClaimRepository;
 import com.steelsnake.cardamage.claim.ClaimStatus;
 import com.steelsnake.cardamage.claim.ImageStorage;
+import com.steelsnake.cardamage.auth.AdminUserRepository;
 import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
@@ -51,12 +53,19 @@ class CarDamageApplicationTests {
 			.withDatabaseName("car_damage_test");
 	private static final Path imageDirectory = Path.of(
 			"build", "test-images", UUID.randomUUID().toString()).toAbsolutePath();
+	private static final String adminPassword = "integration-test-password";
+	private static final String adminPasswordHash =
+			new org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder().encode(adminPassword);
 
 	@Autowired
 	private ClaimRepository claimRepository;
 
 	@Autowired
 	private ClaimImageRepository claimImageRepository;
+	@Autowired
+	private AdminUserRepository adminUserRepository;
+	@Autowired
+	private PasswordEncoder passwordEncoder;
 	@Autowired
 	private ApplicationContext applicationContext;
 
@@ -65,6 +74,9 @@ class CarDamageApplicationTests {
 	@DynamicPropertySource
 	static void imageStorageProperties(DynamicPropertyRegistry registry) {
 		registry.add("app.image-storage.directory", imageDirectory::toString);
+		registry.add("app.security.jwt.secret", () -> "integration-test-jwt-secret-at-least-32-bytes");
+		registry.add("spring.flyway.placeholders.admin-email", () -> "admin@integration.test");
+		registry.add("spring.flyway.placeholders.admin-password-hash", () -> adminPasswordHash);
 	}
 
 	@BeforeEach
@@ -103,6 +115,18 @@ class CarDamageApplicationTests {
 				})
 				.expectComplete()
 				.verify(Duration.ofSeconds(30));
+	}
+
+	@Test
+	void migrationPersistsAdminWithBcryptPassword() {
+		StepVerifier.create(this.adminUserRepository.findByEmail("admin@integration.test"))
+				.assertNext(admin -> {
+					assertThat(admin.passwordHash()).startsWith("$2");
+					assertThat(admin.passwordHash()).doesNotContain(adminPassword);
+					assertThat(this.passwordEncoder.matches(adminPassword, admin.passwordHash())).isTrue();
+				})
+				.expectComplete()
+				.verify(Duration.ofSeconds(10));
 	}
 
 	@Test

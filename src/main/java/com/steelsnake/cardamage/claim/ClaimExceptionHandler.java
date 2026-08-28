@@ -9,7 +9,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
-@RestControllerAdvice(assignableTypes = ClaimController.class)
+@RestControllerAdvice(assignableTypes = {ClaimController.class, AdminClaimController.class})
 class ClaimExceptionHandler {
 
 	@ExceptionHandler(ClaimApiException.class)
