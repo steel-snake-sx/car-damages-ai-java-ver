@@ -321,11 +321,11 @@ public class ImageStorage {
 	static final class ImageBatch {
 
 		private final UUID stagingId;
-		// State and operation share this monitor so cleanup cannot miss newly registered work.
+		// состояние и текущую операцию меняем под одним монитором, чтобы очистка не пропустила новую работу
 		private State state = State.REQUEST;
 		private volatile List<StagedImage> images = List.of();
 		private volatile UUID claimId;
-		// Cached filesystem work survives cancellation so cleanup can join it before deleting.
+		// кешируем операцию, чтобы при отмене дождаться её перед удалением файлов
 		private Mono<Void> filesystemOperation = Mono.empty();
 
 		ImageBatch(UUID stagingId) {

@@ -46,7 +46,8 @@ public class ClaimController {
 					brand, model, parseCarYear(year), images);
 		})
 				.map(response -> ResponseEntity
-						.created(URI.create("/api/claims/" + response.id() + "/status"))
+						.accepted()
+						.location(URI.create("/api/claims/" + response.id() + "/status"))
 						.body(response));
 	}
 

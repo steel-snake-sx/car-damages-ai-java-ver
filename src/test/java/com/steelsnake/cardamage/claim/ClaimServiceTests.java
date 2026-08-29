@@ -10,17 +10,24 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import javax.imageio.ImageIO;
 
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.TopicPartition;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.codec.multipart.FilePart;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.TransactionException;
 import org.springframework.transaction.TransactionSystemException;
@@ -35,7 +42,10 @@ import reactor.test.StepVerifier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -48,18 +58,22 @@ class ClaimServiceTests {
 	private ClaimRepository claimRepository;
 	private ClaimImageRepository imageRepository;
 	private TestTransactionManager transactionManager;
+	private KafkaTemplate<String, DamageAnalysisRequested> kafkaTemplate;
 	private ClaimService service;
 
 	@BeforeEach
+	@SuppressWarnings("unchecked")
 	void configureService() {
 		this.claimRepository = mock(ClaimRepository.class);
 		this.imageRepository = mock(ClaimImageRepository.class);
 		this.transactionManager = new TestTransactionManager();
+		this.kafkaTemplate = mock(KafkaTemplate.class);
 		this.service = new ClaimService(
 				this.claimRepository,
 				this.imageRepository,
 				new ImageStorage(this.temporaryDirectory.toString()),
-				TransactionalOperator.create(this.transactionManager));
+				TransactionalOperator.create(this.transactionManager),
+				this.kafkaTemplate);
 	}
 
 	@Test
@@ -83,6 +97,94 @@ class ClaimServiceTests {
 	}
 
 	@Test
+	void publishesOneClaimReferenceEventKeyedByClaimId() throws IOException {
+		UUID claimId = configureSuccessfulPersistence();
+
+		StepVerifier.create(this.service.createClaim(
+				"Toyota", "Camry", 2022, List.of(filePart(createPng()))))
+				.expectNextCount(1)
+				.expectComplete()
+				.verify(Duration.ofSeconds(5));
+
+		verify(this.kafkaTemplate, times(1)).send(
+				eq(DamageAnalysisRequested.TOPIC),
+				eq(claimId.toString()),
+				eq(new DamageAnalysisRequested(1, claimId)));
+	}
+
+	@Test
+	void publishesOnlyAfterTheClaimTransactionCommits() throws IOException {
+		UUID claimId = configureClaimSave();
+		when(this.imageRepository.save(any(ClaimImage.class))).thenAnswer(invocation -> {
+			ClaimImage image = invocation.getArgument(0);
+			return Mono.just(new ClaimImage(
+					UUID.randomUUID(), image.claimId(), image.storagePath(), image.originalFilename(),
+					image.contentType(), image.sizeBytes(), image.createdAt()));
+		});
+		CompletableFuture<SendResult<String, DamageAnalysisRequested>> pendingSend = new CompletableFuture<>();
+		CountDownLatch sendStarted = new CountDownLatch(1);
+		int[] commitsWhenSendStarted = new int[1];
+		when(this.kafkaTemplate.send(anyString(), anyString(), any(DamageAnalysisRequested.class)))
+				.thenAnswer(invocation -> {
+					commitsWhenSendStarted[0] = this.transactionManager.commits;
+					sendStarted.countDown();
+					return pendingSend;
+				});
+
+		StepVerifier.create(this.service.createClaim(
+				"Toyota", "Camry", 2022, List.of(filePart(createPng()))))
+				.then(() -> {
+					assertThat(await(sendStarted)).isTrue();
+					pendingSend.complete(sendResult(claimId));
+				})
+				.expectNextCount(1)
+				.expectComplete()
+				.verify(Duration.ofSeconds(5));
+
+		assertThat(commitsWhenSendStarted[0]).isEqualTo(1);
+		assertThat(this.transactionManager.rollbacks).isZero();
+	}
+
+	@Test
+	void publishFailureReportsUnavailableDispatchAndKeepsCommittedFiles() throws IOException {
+		UUID claimId = configureSuccessfulPersistence();
+		when(this.kafkaTemplate.send(anyString(), anyString(), any(DamageAnalysisRequested.class)))
+				.thenReturn(CompletableFuture.failedFuture(new IllegalStateException("broker down")));
+
+		StepVerifier.create(this.service.createClaim(
+				"Toyota", "Camry", 2022, List.of(filePart(createPng()))))
+				.expectErrorSatisfies(error -> assertThat(error)
+						.isInstanceOf(ClaimApiException.class)
+						.satisfies(failure -> assertThat(((ClaimApiException) failure).status())
+								.isEqualTo(HttpStatus.SERVICE_UNAVAILABLE))
+						.hasMessageContaining(claimId.toString()))
+				.verify(Duration.ofSeconds(5));
+
+		assertThat(this.transactionManager.commits).isEqualTo(1);
+		assertThat(this.transactionManager.rollbacks).isZero();
+		assertThat(this.temporaryDirectory.resolve(claimId.toString())).isDirectory();
+		assertStagingIsEmpty();
+	}
+
+	@Test
+	void startAnalysisTransitionsEligibleClaimAndIgnoresRedelivery() {
+		UUID claimId = UUID.randomUUID();
+		when(this.claimRepository.startAnalysis(eq(claimId), any(Instant.class)))
+				.thenReturn(Mono.just(1L))
+				.thenReturn(Mono.just(0L));
+
+		StepVerifier.create(this.service.startAnalysis(claimId))
+				.expectComplete()
+				.verify(Duration.ofSeconds(1));
+		StepVerifier.create(this.service.startAnalysis(claimId))
+				.expectComplete()
+				.verify(Duration.ofSeconds(1));
+
+		verify(this.claimRepository, times(2)).startAnalysis(eq(claimId), any(Instant.class));
+		verifyNoInteractions(this.imageRepository);
+	}
+
+	@Test
 	void persistenceFailureRollsBackAndRemovesFinalizedFiles() throws IOException {
 		UUID claimId = configureClaimSave();
 		when(this.imageRepository.save(any(ClaimImage.class)))
@@ -96,6 +198,7 @@ class ClaimServiceTests {
 		assertThat(this.transactionManager.rollbacks).isEqualTo(1);
 		assertThat(this.temporaryDirectory.resolve(claimId.toString())).doesNotExist();
 		assertStagingIsEmpty();
+		verifyNoInteractions(this.kafkaTemplate);
 	}
 
 	@Test
@@ -206,7 +309,19 @@ class ClaimServiceTests {
 					UUID.randomUUID(), image.claimId(), image.storagePath(), image.originalFilename(),
 					image.contentType(), image.sizeBytes(), image.createdAt()));
 		});
+		when(this.kafkaTemplate.send(anyString(), anyString(), any(DamageAnalysisRequested.class)))
+				.thenReturn(CompletableFuture.completedFuture(sendResult(claimId)));
 		return claimId;
+	}
+
+	private static SendResult<String, DamageAnalysisRequested> sendResult(UUID claimId) {
+		TopicPartition partition = new TopicPartition(DamageAnalysisRequested.TOPIC, 0);
+		return new SendResult<>(
+				new ProducerRecord<>(
+						DamageAnalysisRequested.TOPIC,
+						claimId.toString(),
+						DamageAnalysisRequested.of(claimId)),
+				new RecordMetadata(partition, 0L, 0, 0L, 0, 0));
 	}
 
 	private UUID configureClaimSave() {

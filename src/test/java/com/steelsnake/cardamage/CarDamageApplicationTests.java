@@ -7,14 +7,26 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.imageio.ImageIO;
 
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.kafka.KafkaContainer;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
 import org.springframework.beans.factory.annotation.Autowired;
@@ -22,11 +34,17 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.context.ApplicationContext;
 import org.springframework.core.io.ByteArrayResource;
+import org.springframework.dao.TransientDataAccessResourceException;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.MultipartBodyBuilder;
+import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
+import org.springframework.kafka.core.DefaultKafkaProducerFactory;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.listener.MessageListenerContainer;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.reactive.server.WebTestClient;
 import org.springframework.web.reactive.function.BodyInserters;
 
@@ -35,13 +53,20 @@ import com.steelsnake.cardamage.claim.Claim;
 import com.steelsnake.cardamage.claim.ClaimImage;
 import com.steelsnake.cardamage.claim.ClaimImageRepository;
 import com.steelsnake.cardamage.claim.ClaimRepository;
+import com.steelsnake.cardamage.claim.ClaimService;
 import com.steelsnake.cardamage.claim.ClaimStatus;
 import com.steelsnake.cardamage.claim.ClaimStatusResponse;
+import com.steelsnake.cardamage.claim.DamageAnalysisRequested;
 import com.steelsnake.cardamage.claim.ImageStorage;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
 import reactor.test.StepVerifier;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 @Testcontainers(disabledWithoutDocker = true)
 @SpringBootTest
@@ -51,6 +76,9 @@ class CarDamageApplicationTests {
 	@ServiceConnection
 	static final PostgreSQLContainer postgres = new PostgreSQLContainer("postgres:18-alpine")
 			.withDatabaseName("car_damage_test");
+	@Container
+	@ServiceConnection
+	static final KafkaContainer kafka = new KafkaContainer("apache/kafka:4.1.1");
 	private static final Path imageDirectory = Path.of(
 			"build", "test-images", UUID.randomUUID().toString()).toAbsolutePath();
 	private static final String adminPassword = "integration-test-password";
@@ -68,6 +96,12 @@ class CarDamageApplicationTests {
 	private PasswordEncoder passwordEncoder;
 	@Autowired
 	private ApplicationContext applicationContext;
+	@Autowired
+	private KafkaTemplate<String, DamageAnalysisRequested> kafkaTemplate;
+	@Autowired
+	private KafkaListenerEndpointRegistry listenerRegistry;
+	@MockitoSpyBean
+	private ClaimService claimService;
 
 	private WebTestClient webTestClient;
 
@@ -77,6 +111,7 @@ class CarDamageApplicationTests {
 		registry.add("app.security.jwt.secret", () -> "integration-test-jwt-secret-at-least-32-bytes");
 		registry.add("spring.flyway.placeholders.admin-email", () -> "admin@integration.test");
 		registry.add("spring.flyway.placeholders.admin-password-hash", () -> adminPasswordHash);
+		registry.add("app.kafka.analysis-retry-interval", () -> "10ms");
 	}
 
 	@BeforeEach
@@ -148,7 +183,7 @@ class CarDamageApplicationTests {
 				.contentType(MediaType.MULTIPART_FORM_DATA)
 				.body(BodyInserters.fromMultipartData(body.build()))
 				.exchange()
-				.expectStatus().isCreated()
+				.expectStatus().isAccepted()
 				.expectHeader().valueMatches("Location", "/api/claims/.+/status")
 				.expectBody(ClaimStatusResponse.class)
 				.returnResult()
@@ -162,7 +197,6 @@ class CarDamageApplicationTests {
 				this.claimImageRepository.findAllByClaimId(created.id()).single()))
 				.assertNext(values -> {
 					assertThat(values.getT1().carBrand()).isEqualTo("Toyota");
-					assertThat(values.getT1().status()).isEqualTo(ClaimStatus.ANALYSIS_PENDING);
 					assertThat(values.getT2().originalFilename()).isEqualTo("damage.png");
 					assertThat(Files.exists(imageDirectory.resolve(values.getT2().storagePath()))).isTrue();
 				})
@@ -175,9 +209,176 @@ class CarDamageApplicationTests {
 				.expectStatus().isOk()
 				.expectBody()
 				.jsonPath("$.id").isEqualTo(created.id().toString())
-				.jsonPath("$.status").isEqualTo("ANALYSIS_PENDING")
 				.jsonPath("$.carBrand").doesNotExist()
 				.jsonPath("$.carModel").doesNotExist();
+	}
+
+	@Test
+	void publishedAnalysisRequestTransitionsClaimToAnalyzing() throws Exception {
+		UUID claimId = submitClaim();
+
+		Claim analyzing = awaitStatus(claimId, ClaimStatus.ANALYZING);
+
+		assertThat(analyzing.status()).isEqualTo(ClaimStatus.ANALYZING);
+		assertThat(analyzing.updatedAt()).isAfterOrEqualTo(analyzing.createdAt());
+	}
+
+	@Test
+	void redeliveredAnalysisRequestDoesNotRepeatProcessing() throws Exception {
+		UUID claimId = submitClaim();
+		Claim analyzing = awaitStatus(claimId, ClaimStatus.ANALYZING);
+
+		var redelivered = this.kafkaTemplate.send(
+						DamageAnalysisRequested.TOPIC,
+						claimId.toString(),
+						new DamageAnalysisRequested(DamageAnalysisRequested.VERSION, claimId))
+				.get(10, TimeUnit.SECONDS);
+		awaitCommittedOffset(
+				new TopicPartition(
+						redelivered.getRecordMetadata().topic(), redelivered.getRecordMetadata().partition()),
+				redelivered.getRecordMetadata().offset() + 1);
+
+		Claim afterRedelivery = this.claimRepository.findById(claimId).block(Duration.ofSeconds(10));
+		assertThat(afterRedelivery).isNotNull();
+		assertThat(afterRedelivery.status()).isEqualTo(ClaimStatus.ANALYZING);
+		assertThat(afterRedelivery.updatedAt()).isEqualTo(analyzing.updatedAt());
+	}
+
+	@Test
+	void malformedRecordDoesNotStallLaterAnalysisRequests() throws Exception {
+		Map<String, Object> producerProperties = Map.of(
+				ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers(),
+				ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+				ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+		DefaultKafkaProducerFactory<String, String> producerFactory =
+				new DefaultKafkaProducerFactory<>(producerProperties);
+		TopicPartition malformedPartition;
+		long offsetAfterMalformed;
+		try {
+			var malformed = new KafkaTemplate<>(producerFactory)
+					.send(DamageAnalysisRequested.TOPIC, "malformed", "{not json")
+					.get(10, TimeUnit.SECONDS);
+			malformedPartition = new TopicPartition(
+					malformed.getRecordMetadata().topic(), malformed.getRecordMetadata().partition());
+			offsetAfterMalformed = malformed.getRecordMetadata().offset() + 1;
+		}
+		finally {
+			producerFactory.destroy();
+		}
+
+		awaitCommittedOffset(malformedPartition, offsetAfterMalformed);
+		MessageListenerContainer container = analysisListenerContainer();
+		try {
+			stopAndAwait(container);
+			assertThat(committedOffset(malformedPartition)).isGreaterThanOrEqualTo(offsetAfterMalformed);
+
+			container.start();
+			assertThat(container.isRunning()).isTrue();
+			assertThat(committedOffset(malformedPartition)).isGreaterThanOrEqualTo(offsetAfterMalformed);
+
+			UUID claimId = submitClaim();
+
+			assertThat(awaitStatus(claimId, ClaimStatus.ANALYZING).status()).isEqualTo(ClaimStatus.ANALYZING);
+		}
+		finally {
+			if (!container.isRunning()) {
+				container.start();
+			}
+		}
+	}
+
+	@Test
+	void temporaryPersistenceFailureIsRetriedAndUltimatelyProcessed() throws Exception {
+		Claim pending = savePendingClaim("Toyota", "Camry", 2022);
+		doReturn(Mono.error(new TransientDataAccessResourceException("database is down")))
+				.doCallRealMethod()
+				.when(this.claimService).startAnalysis(pending.id());
+
+		this.kafkaTemplate.send(
+						DamageAnalysisRequested.TOPIC,
+						pending.id().toString(),
+						new DamageAnalysisRequested(DamageAnalysisRequested.VERSION, pending.id()))
+				.get(10, TimeUnit.SECONDS);
+
+		assertThat(awaitStatus(pending.id(), ClaimStatus.ANALYZING).status())
+				.isEqualTo(ClaimStatus.ANALYZING);
+		verify(this.claimService, times(2)).startAnalysis(pending.id());
+
+		Claim followUp = savePendingClaim("Honda", "Civic", 2023);
+		var followUpSent = this.kafkaTemplate.send(
+						DamageAnalysisRequested.TOPIC,
+						followUp.id().toString(),
+						new DamageAnalysisRequested(DamageAnalysisRequested.VERSION, followUp.id()))
+				.get(10, TimeUnit.SECONDS);
+
+		assertThat(awaitStatus(followUp.id(), ClaimStatus.ANALYZING).status())
+				.isEqualTo(ClaimStatus.ANALYZING);
+		awaitCommittedOffset(
+				new TopicPartition(
+						followUpSent.getRecordMetadata().topic(), followUpSent.getRecordMetadata().partition()),
+				followUpSent.getRecordMetadata().offset() + 1);
+	}
+
+	@Test
+	void persistenceFailureKeepsRecordRedeliverableAcrossListenerRestart() throws Exception {
+		Claim pending = savePendingClaim("Toyota", "Corolla", 2021);
+		CountDownLatch firstAttemptFailed = new CountDownLatch(1);
+		CountDownLatch oldAttemptParked = new CountDownLatch(1);
+		CountDownLatch postRestartDelivery = new CountDownLatch(1);
+		AtomicBoolean persistenceRecovered = new AtomicBoolean();
+		AtomicInteger processingAttempts = new AtomicInteger();
+		Sinks.One<Void> parkedOldAttempt = Sinks.one();
+		doAnswer(invocation -> {
+			int attempt = processingAttempts.incrementAndGet();
+			if (attempt == 1) {
+				firstAttemptFailed.countDown();
+				return Mono.error(new TransientDataAccessResourceException("database is down"));
+			}
+			if (attempt == 2) {
+				oldAttemptParked.countDown();
+				return parkedOldAttempt.asMono();
+			}
+			if (persistenceRecovered.get()) {
+				postRestartDelivery.countDown();
+				return invocation.callRealMethod();
+			}
+			return Mono.error(new IllegalStateException("processing resumed before persistence recovery"));
+		}).when(this.claimService).startAnalysis(pending.id());
+
+		var sent = this.kafkaTemplate.send(
+						DamageAnalysisRequested.TOPIC,
+						pending.id().toString(),
+						new DamageAnalysisRequested(DamageAnalysisRequested.VERSION, pending.id()))
+				.get(10, TimeUnit.SECONDS);
+		TopicPartition partition = new TopicPartition(
+				sent.getRecordMetadata().topic(), sent.getRecordMetadata().partition());
+		assertThat(firstAttemptFailed.await(30, TimeUnit.SECONDS)).isTrue();
+		assertThat(oldAttemptParked.await(30, TimeUnit.SECONDS)).isTrue();
+
+		MessageListenerContainer container = analysisListenerContainer();
+		try {
+			stopAndAwait(container);
+
+			Claim beforeRestart = this.claimRepository.findById(pending.id()).block(Duration.ofSeconds(10));
+			assertThat(beforeRestart).isNotNull();
+			assertThat(beforeRestart.status()).isEqualTo(ClaimStatus.ANALYSIS_PENDING);
+			assertThat(committedOffset(partition)).isLessThanOrEqualTo(sent.getRecordMetadata().offset());
+
+			persistenceRecovered.set(true);
+			container.start();
+			assertThat(container.isRunning()).isTrue();
+
+			assertThat(postRestartDelivery.await(30, TimeUnit.SECONDS)).isTrue();
+			assertThat(awaitStatus(pending.id(), ClaimStatus.ANALYZING).status())
+					.isEqualTo(ClaimStatus.ANALYZING);
+			awaitCommittedOffset(partition, sent.getRecordMetadata().offset() + 1);
+		}
+		finally {
+			parkedOldAttempt.tryEmitEmpty();
+			if (!container.isRunning()) {
+				container.start();
+			}
+		}
 	}
 
 	@Test
@@ -309,6 +510,78 @@ class CarDamageApplicationTests {
 				.contentType(MediaType.MULTIPART_FORM_DATA)
 				.body(BodyInserters.fromMultipartData(body.build()))
 				.exchange();
+	}
+
+	private UUID submitClaim() throws IOException {
+		MultipartBodyBuilder body = vehicleParts();
+		body.part("images", imageResource("damage.png", createPng())).contentType(MediaType.IMAGE_PNG);
+
+		ClaimStatusResponse accepted = postMultipart(body)
+				.expectStatus().isAccepted()
+				.expectBody(ClaimStatusResponse.class)
+				.returnResult()
+				.getResponseBody();
+
+		assertThat(accepted).isNotNull();
+		assertThat(accepted.status()).isEqualTo(ClaimStatus.ANALYSIS_PENDING);
+		return accepted.id();
+	}
+
+	private Claim awaitStatus(UUID claimId, ClaimStatus expected) throws InterruptedException {
+		for (int attempt = 0; attempt < 60; attempt++) {
+			Claim claim = this.claimRepository.findById(claimId).block(Duration.ofSeconds(10));
+			if (claim != null && claim.status() == expected) {
+				return claim;
+			}
+			Thread.sleep(500);
+		}
+		throw new AssertionError("Claim " + claimId + " did not reach " + expected);
+	}
+
+	private Claim savePendingClaim(String brand, String model, int year) {
+		Instant now = Instant.now();
+		Claim pending = this.claimRepository.save(new Claim(
+				null, brand, model, year, ClaimStatus.ANALYSIS_PENDING, now, now))
+				.block(Duration.ofSeconds(10));
+		assertThat(pending).isNotNull();
+		return pending;
+	}
+
+	private MessageListenerContainer analysisListenerContainer() {
+		MessageListenerContainer container = this.listenerRegistry.getListenerContainers().stream()
+				.findFirst()
+				.orElseThrow(() -> new AssertionError("Analysis listener container is missing"));
+		assertThat(container.isRunning()).isTrue();
+		return container;
+	}
+
+	private static void stopAndAwait(MessageListenerContainer container) throws InterruptedException {
+		CountDownLatch stopped = new CountDownLatch(1);
+		container.stop(stopped::countDown);
+		assertThat(stopped.await(30, TimeUnit.SECONDS)).isTrue();
+		assertThat(container.isRunning()).isFalse();
+	}
+
+	private void awaitCommittedOffset(TopicPartition partition, long expectedOffset) throws Exception {
+		for (int attempt = 0; attempt < 300; attempt++) {
+			if (committedOffset(partition) >= expectedOffset) {
+				return;
+			}
+			Thread.sleep(100);
+		}
+		throw new AssertionError("Consumer did not commit offset " + expectedOffset + " for " + partition);
+	}
+
+	private long committedOffset(TopicPartition partition) throws Exception {
+		Map<String, Object> adminProperties = Map.of(
+				AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers());
+		try (Admin admin = Admin.create(adminProperties)) {
+			OffsetAndMetadata committed = admin.listConsumerGroupOffsets("car-damage-analysis")
+					.partitionsToOffsetAndMetadata()
+					.get(10, TimeUnit.SECONDS)
+					.get(partition);
+			return committed == null ? -1 : committed.offset();
+		}
 	}
 
 	private static MultipartBodyBuilder vehicleParts() {
