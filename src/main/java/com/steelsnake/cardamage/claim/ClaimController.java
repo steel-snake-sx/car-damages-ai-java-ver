@@ -20,6 +20,11 @@ import org.springframework.web.bind.annotation.RestController;
 
 import reactor.core.publisher.Mono;
 
+import io.swagger.v3.oas.annotations.media.ArraySchema;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.media.SchemaProperty;
+
 @RestController
 @RequestMapping("/api/claims")
 public class ClaimController {
@@ -33,6 +38,22 @@ public class ClaimController {
 	}
 
 	@PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+	@io.swagger.v3.oas.annotations.parameters.RequestBody(
+			required = true,
+			content = @Content(
+					mediaType = MediaType.MULTIPART_FORM_DATA_VALUE,
+					schema = @Schema(
+							type = "object",
+							requiredProperties = {"carBrand", "carModel", "carYear", "images"}),
+					schemaProperties = {
+							@SchemaProperty(name = "carBrand", schema = @Schema(type = "string")),
+							@SchemaProperty(name = "carModel", schema = @Schema(type = "string")),
+							@SchemaProperty(name = "carYear", schema = @Schema(type = "integer", format = "int32")),
+							@SchemaProperty(name = "images", array = @ArraySchema(
+									minItems = 1,
+									maxItems = 3,
+									schema = @Schema(type = "string", format = "binary")))
+				}))
 	public Mono<ResponseEntity<ClaimStatusResponse>> createClaim(
 			@RequestBody Mono<MultiValueMap<String, Part>> multipartBody) {
 		return multipartBody.flatMap(parts -> {

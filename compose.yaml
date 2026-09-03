@@ -1,4 +1,30 @@
 services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      DB_R2DBC_URL: r2dbc:postgresql://postgres:5432/${POSTGRES_DB:-car_damage}
+      DB_JDBC_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-car_damage}
+      DB_USERNAME: ${POSTGRES_USER:-car_damage}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-car_damage}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      JWT_SECRET: ${JWT_SECRET:-dev-only-jwt-secret-change-me-32-bytes}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@localhost}
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:-$$2a$$10$$GCMQ8.9DazsbGn3GcB3SY.GYV6luXY3OyzEgwm4S5qeNbzoNa8Zkq}
+      AI_PROVIDER: ${AI_PROVIDER:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      IMAGE_STORAGE_PATH: /app/data/images
+    ports:
+      - "127.0.0.1:${APP_PORT:-8080}:8080"
+    volumes:
+      - image-data:/app/data/images
+
   postgres:
     image: postgres:18-alpine
     environment:
@@ -43,5 +69,6 @@ services:
       retries: 10
 
 volumes:
+  image-data:
   kafka-data:
   postgres-data:

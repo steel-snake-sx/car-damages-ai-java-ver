@@ -187,6 +187,59 @@ class CarDamageApplicationTests {
 	}
 
 	@Test
+	void openApiDocsArePublicAndDescribeTheApi() {
+		this.webTestClient.get()
+				.uri("/v3/api-docs")
+				.exchange()
+				.expectStatus().isOk()
+				.expectBody()
+				.jsonPath("$.info.title").isEqualTo("Car Damage AI API")
+				.jsonPath("$.info.version").isEqualTo("1.0")
+				.jsonPath("$.components.securitySchemes.bearerAuth.type").isEqualTo("http")
+				.jsonPath("$.components.securitySchemes.bearerAuth.scheme").isEqualTo("bearer")
+				.jsonPath("$.components.securitySchemes.bearerAuth.bearerFormat").isEqualTo("JWT")
+				.jsonPath("$.paths['/api/auth/login']").exists()
+				.jsonPath("$.paths['/api/claims']").exists()
+				.jsonPath("$.paths['/api/claims/{id}/status']").exists()
+				.jsonPath("$.paths['/api/admin/claims']").exists()
+				.jsonPath("$.paths['/api/admin/claims/{id}']").exists()
+				.jsonPath("$.components.schemas.LoginResponse").exists()
+				.jsonPath("$.components.schemas.ClaimStatusResponse").exists()
+				.jsonPath("$.components.schemas.AdminClaimSummary").exists()
+				.jsonPath("$.components.schemas.AdminClaimDetails").exists()
+				.jsonPath("$.components.schemas.Analysis").exists()
+				.jsonPath("$.components.schemas.Finding").exists()
+				.jsonPath("$.components.schemas.AdminClaimDetails.properties.analysisFailureReason.enum[0]")
+				.isEqualTo("AI_UNAVAILABLE")
+				.jsonPath("$.paths['/api/claims'].post.requestBody.content['multipart/form-data'].schema.type")
+				.isEqualTo("object")
+				.jsonPath("$.paths['/api/claims'].post.requestBody.content['multipart/form-data'].schema.properties.images.type")
+				.isEqualTo("array")
+				.jsonPath("$.paths['/api/claims'].post.requestBody.content['multipart/form-data'].schema.properties.images.minItems")
+				.isEqualTo(1)
+				.jsonPath("$.paths['/api/claims'].post.requestBody.content['multipart/form-data'].schema.properties.images.maxItems")
+				.isEqualTo(3)
+				.jsonPath("$.paths['/api/claims'].post.requestBody.content['multipart/form-data'].schema.properties.images.items.type")
+				.isEqualTo("string")
+				.jsonPath("$.paths['/api/claims'].post.requestBody.content['multipart/form-data'].schema.properties.images.items.format")
+				.isEqualTo("binary");
+	}
+
+	@Test
+	void swaggerUiIsPublic() {
+		this.webTestClient.get()
+				.uri("/swagger-ui.html")
+				.exchange()
+				.expectStatus().is3xxRedirection()
+				.expectHeader().valueMatches("Location", ".*/swagger-ui/index.html");
+
+		this.webTestClient.get()
+				.uri("/swagger-ui/index.html")
+				.exchange()
+				.expectStatus().isOk();
+	}
+
+	@Test
 	void claimSubmissionPersistsImagesAndExposesOnlyPublicStatus() throws IOException {
 		byte[] png = createPng();
 		MultipartBodyBuilder body = new MultipartBodyBuilder();

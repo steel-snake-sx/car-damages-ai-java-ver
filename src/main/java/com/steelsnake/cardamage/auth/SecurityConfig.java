@@ -62,6 +62,12 @@ public class SecurityConfig {
 						.authenticationEntryPoint(unauthorized)
 						.accessDeniedHandler(forbidden))
 				.authorizeExchange(exchanges -> exchanges
+						.pathMatchers(
+								"/swagger-ui.html",
+								"/swagger-ui/**",
+								"/v3/api-docs",
+								"/v3/api-docs/**",
+								"/v3/api-docs.yaml").permitAll()
 						.pathMatchers(HttpMethod.POST, "/api/claims", "/api/auth/login").permitAll()
 						.pathMatchers(HttpMethod.GET, "/api/claims/{id}/status").permitAll()
 						.pathMatchers("/api/admin/**").hasRole("ADMIN")
