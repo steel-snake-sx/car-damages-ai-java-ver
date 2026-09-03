@@ -10,70 +10,70 @@
 ![OpenAI](https://img.shields.io/badge/AI-OpenAI_Responses_API-111827)
 ![Docker Compose](https://img.shields.io/badge/Infrastructure-Docker_Compose-2496ED)
 
-Backend-сервис для асинхронного анализа повреждений автомобиля по фотографиям.
+Бэкенд для асинхронного анализа повреждений автомобиля по фотографиям.
 
-Пользователь создаёт заявку, указывает автомобиль и загружает фотографии. Backend сохраняет заявку и изображения, публикует событие в Kafka, а обработчик выполняет анализ через deterministic mock или OpenAI Responses API и сохраняет структурированный результат в PostgreSQL.
+Пользователь создаёт заявку, указывает данные автомобиля и загружает фотографии. Бэкенд сохраняет заявку и файлы, публикует событие в Kafka, после чего обработчик выполняет анализ в режиме mock или через OpenAI Responses API и сохраняет результат в PostgreSQL.
 
 ## Основные возможности
 
-- публичное создание заявки через `multipart/form-data`;
-- данные автомобиля и от 1 до 3 фотографий JPEG/PNG;
-- локальное файловое хранилище с Docker volume;
-- асинхронный анализ через Kafka;
-- deterministic `MockDamageAnalyzer` по умолчанию;
-- опциональный анализ через OpenAI Responses API;
-- JWT authentication и admin API;
+- создание заявки через `multipart/form-data`;
+- данные автомобиля и от 1 до 3 фотографий в форматах JPEG и PNG;
+- локальное файловое хранилище с томом Docker;
+- асинхронная обработка заявок через Kafka;
+- детерминированный `MockDamageAnalyzer` по умолчанию;
+- необязательный анализ через OpenAI Responses API;
+- JWT-аутентификация и API администратора;
 - статусы `ANALYSIS_PENDING`, `ANALYZING`, `ANALYZED`, `ANALYSIS_FAILED`;
-- Swagger UI и OpenAPI 3;
+- OpenAPI 3 и Swagger UI;
 - PostgreSQL, Flyway и Testcontainers.
 
-## Ключевой сценарий работы
+## Как обрабатывается заявка
 
-1. Client отправляет multipart-заявку с автомобилем и фотографиями.
-2. Изображения валидируются до сохранения.
-3. Claim и metadata сохраняются в PostgreSQL.
-4. Filesystem и DB проходят существующий consistency flow.
-5. После commit событие публикуется в Kafka.
-6. HTTP возвращает `202 Accepted` после broker acknowledgement.
-7. Kafka worker получает заявку и получает owner/lease.
-8. Claim переходит в `ANALYZING`.
-9. `DamageAnalyzer` получает изображения и возвращает structured result.
-10. Result и findings сохраняются в одной транзакции с terminal status.
-11. Claim становится `ANALYZED` или `ANALYSIS_FAILED`.
+1. Клиент отправляет multipart-заявку с данными автомобиля и фотографиями.
+2. Изображения проверяются до сохранения.
+3. Заявка и её метаданные сохраняются в PostgreSQL.
+4. Файлы и записи в БД проходят согласованный сценарий сохранения.
+5. После фиксации транзакции событие публикуется в Kafka.
+6. HTTP-ответ `202 Accepted` отправляется после подтверждения от Kafka.
+7. Обработчик Kafka получает заявку и право на её обработку.
+8. Статус заявки меняется на `ANALYZING`.
+9. `DamageAnalyzer` получает изображения и возвращает структурированный результат.
+10. Результат анализа, найденные повреждения и конечный статус сохраняются в одной транзакции.
+11. Статус заявки меняется на `ANALYZED` или `ANALYSIS_FAILED`.
 
 ## Архитектура
 
-Проект представляет собой один Spring Boot deployable в виде modular monolith. Код организован package-by-feature: HTTP, authentication, claims, analysis и persistence находятся в своих feature-пакетах.
+Проект представляет собой одно приложение на Spring Boot с модульной монолитной структурой. Код организован по функциональным пакетам: отдельно находятся заявки, аутентификация, анализ и работа с хранилищами.
 
-WebFlux обслуживает HTTP, PostgreSQL подключён через R2DBC, Kafka является asynchronous boundary, а `DamageAnalyzer` изолирует внешний AI-контракт от orchestration-кода. Фотографии хранятся в локальной filesystem, подключённой как Docker volume.
+WebFlux обслуживает HTTP-запросы, PostgreSQL подключён через R2DBC, Kafka отделяет создание заявки от её анализа, а `DamageAnalyzer` скрывает детали конкретного анализатора. Фотографии хранятся в локальной файловой системе и подключаются к приложению через том Docker.
 
-### Компонентная архитектура
+### Компонентная схема
 
 ```mermaid
 flowchart LR
-    Client[Client] --> Api[Spring WebFlux API]
+    Client[Клиент] --> Api[Spring WebFlux API]
     Api --> Db[(PostgreSQL)]
-    Api --> Files[(Local filesystem)]
+    Api --> Files[(Файловое хранилище)]
     Api --> Kafka[(Apache Kafka)]
-    Kafka --> Worker[Analysis worker]
+    Kafka --> Worker[Обработчик анализа]
     Worker --> Analyzer[DamageAnalyzer]
-    Analyzer --> Mock[Deterministic mock]
+    Analyzer --> Mock[Детерминированный mock]
     Analyzer --> OpenAI[OpenAI Responses API]
     Worker --> Db
 ```
 
-### Обработка заявки
+### Сценарий обработки заявки
 
 ```mermaid
 flowchart LR
-    Submit[POST /api/claims] --> Validate[Validate multipart]
-    Validate --> Persist[Persist claim and images]
-    Persist --> Publish[Publish Kafka event]
+    Submit[POST /api/claims] --> Validate[Проверка multipart]
+    Validate --> Persist[Сохранение заявки и файлов]
+    Persist --> Publish[Публикация события в Kafka]
     Publish --> Accepted[202 Accepted]
-    Publish --> Worker[Analysis worker]
-    Worker --> Ownership[ANALYZING + owner lease]
-    Ownership --> AI[Mock or OpenAI]
-    AI --> Result[Atomic result persistence]
+    Publish --> Worker[Обработчик анализа]
+    Worker --> Ownership[ANALYZING и право на обработку]
+    Ownership --> AI[Mock или OpenAI]
+    AI --> Result[Атомарное сохранение результата]
     Result --> Analyzed[ANALYZED]
     Result --> Failed[ANALYSIS_FAILED]
 ```
@@ -82,41 +82,41 @@ flowchart LR
 
 | Область | Технологии |
 | --- | --- |
-| Language | Java 21 |
-| Framework | Spring Boot 4.1.1, Spring WebFlux |
-| Reactive | Project Reactor |
-| Auth | Spring Security, JWT Bearer, BCrypt |
-| Data | PostgreSQL, Spring Data R2DBC |
-| Migrations | Flyway |
-| Messaging | Apache Kafka |
-| AI | OpenAI Responses API, deterministic mock |
-| Storage | Local filesystem |
-| API docs | OpenAPI 3, Swagger UI, springdoc-openapi |
-| Infrastructure | Docker Compose |
-| Tests | JUnit 5, Mockito, Testcontainers |
-| Build | Gradle |
+| Язык | Java 21 |
+| Фреймворк | Spring Boot 4.1.1, Spring WebFlux |
+| Реактивный стек | Project Reactor |
+| Аутентификация | Spring Security, JWT Bearer, BCrypt |
+| Хранение данных | PostgreSQL, Spring Data R2DBC |
+| Миграции | Flyway |
+| Обмен сообщениями | Apache Kafka |
+| Анализ изображений | OpenAI Responses API, детерминированный mock |
+| Файлы | Локальная файловая система |
+| Документация API | OpenAPI 3, Swagger UI, springdoc-openapi |
+| Инфраструктура | Docker Compose |
+| Тестирование | JUnit 5, Mockito, Testcontainers |
+| Сборка | Gradle |
 
-## Backend-особенности / Технические акценты
+## Технические особенности
 
-- WebFlux и R2DBC используются без блокировки event loop.
-- Filesystem операции и потенциально блокирующий `KafkaTemplate.send` изолированы на `boundedElastic`.
-- Kafka publish выполняется после DB transaction commit, а broker acknowledgement ожидается до ответа `202`.
-- AI processing вынесен за пределы HTTP request.
-- AI retry отделён от persistence retry: DB outage не запускает платный AI повторно в одной delivery.
-- Owner token и lease защищают overlapping processing; stale worker не может сохранить terminal result.
-- Result, findings и terminal status сохраняются атомарно.
-- OpenAI использует strict structured output и `store=false`.
-- Mock analyzer позволяет запустить demo без OpenAI key.
-- PostgreSQL и Kafka сценарии проверяются через Testcontainers.
+- WebFlux и R2DBC используются без блокирующих операций в цикле обработки событий.
+- Операции с файлами и потенциально блокирующий вызов `KafkaTemplate.send` выполняются на `boundedElastic`.
+- Публикация в Kafka начинается после фиксации транзакции в БД, а подтверждение брокера ожидается до ответа `202`.
+- Анализ изображений выполняется после HTTP-запроса, в обработчике Kafka.
+- Ретрай AI и ретрай сохранения разделены: сбой PostgreSQL не запускает повторный платный AI-вызов в рамках одной доставки сообщения.
+- Для заявки фиксируются текущий владелец и время действия его права на обработку. Если Kafka повторно доставит сообщение другому обработчику, старый обработчик не сможет сохранить результат.
+- Результат анализа, найденные повреждения и конечный статус сохраняются атомарно.
+- OpenAI возвращает данные в строгом структурированном формате, а в запросе используется `store=false`.
+- `MockDamageAnalyzer` позволяет запустить проект без ключа OpenAI.
+- PostgreSQL- и Kafka-сценарии проверяются через Testcontainers.
 
 ## Интеграции
 
 | Интеграция | Как используется | Локальный режим |
 | --- | --- | --- |
-| OpenAI Responses API | Анализ фотографий и structured damage result | Без key используется `MockDamageAnalyzer` |
-| Apache Kafka | Очередь и asynchronous boundary | Поднимается Docker Compose |
-| PostgreSQL | Claims, statuses и analysis result | Поднимается Docker Compose |
-| Filesystem | Сохранение загруженных фотографий | Используется local volume |
+| OpenAI Responses API | Анализ фотографий и формирование структурированного результата | Без ключа используется `MockDamageAnalyzer` |
+| Apache Kafka | Очередь и асинхронная передача заявки обработчику | Запускается через Docker Compose |
+| PostgreSQL | Заявки, статусы и результаты анализа | Запускается через Docker Compose |
+| Файловая система | Сохранение загруженных фотографий | Используется локальный том |
 
 ## Локальный запуск
 
@@ -125,19 +125,19 @@ flowchart LR
 - Docker Desktop с Docker Compose;
 - Git.
 
-Java и Gradle локально не нужны для основного demo-запуска.
+Для основного сценария Java и Gradle устанавливать локально не нужно.
 
 ### Запуск через Docker
 
-Из корня репозитория:
+Из корня репозитория выполните:
 
 ```bash
 docker compose up --build
 ```
 
-Команда собирает приложение и запускает PostgreSQL, Kafka и Spring Boot app. Flyway применяет migrations автоматически. По умолчанию используется mock AI, поэтому OpenAI key не требуется.
+Команда собирает приложение и запускает PostgreSQL, Kafka и приложение Spring Boot. Flyway применяет миграции автоматически. По умолчанию используется mock-анализ, поэтому ключ OpenAI не нужен.
 
-Адреса:
+Адреса после запуска:
 
 - Swagger UI: `http://localhost:8080/swagger-ui.html`;
 - OpenAPI JSON: `http://localhost:8080/v3/api-docs`;
@@ -149,38 +149,36 @@ docker compose up --build
 docker compose down
 ```
 
-Полностью очистить PostgreSQL, Kafka и загруженные изображения:
+Удалить PostgreSQL, Kafka и загруженные изображения вместе с томами:
 
 ```bash
 docker compose down -v
 ```
 
-Флаг `-v` удаляет named volumes с данными. Используйте его для чистого demo-запуска.
+## Демонстрация
 
-## Demo
-
-В Docker Compose настроен demo admin:
+В Docker Compose настроена демонстрационная учётная запись администратора:
 
 - Email: `admin@localhost`;
-- Password: `admin123`.
+- Пароль: `admin123`.
 
-Проверка через Swagger:
+Проверка через Swagger UI:
 
 1. Откройте Swagger UI.
-2. Выполните `POST /api/auth/login` с demo credentials.
-3. Скопируйте `accessToken` и вставьте только token в `Authorize`.
-4. Выполните `POST /api/claims`, заполните `carBrand`, `carModel`, `carYear` и выберите 1-3 изображения.
+2. Выполните `POST /api/auth/login` с демонстрационными учётными данными.
+3. Скопируйте значение `accessToken` и вставьте его в форму `Authorize`.
+4. Выполните `POST /api/claims`, заполните `carBrand`, `carModel`, `carYear` и выберите от 1 до 3 изображений.
 5. Получите `202 Accepted` и сохраните `id` заявки.
 6. Проверяйте `GET /api/claims/{id}/status`.
-7. После `ANALYZED` откройте admin detail через `GET /api/admin/claims/{id}`.
+7. После `ANALYZED` откройте `GET /api/admin/claims/{id}`.
 
 ## Конфигурация
 
-`docker compose up --build` работает без `.env`: для demo используются безопасные local defaults.
+Команда `docker compose up --build` работает без `.env`: для демонстрации используются безопасные локальные значения по умолчанию.
 
-Файл `.env.example` содержит те же placeholder-значения и может использоваться как основа для локальных переопределений. Реальные секреты в него добавлять нельзя.
+Файл `.env.example` содержит те же значения-заглушки и может использоваться как основа для локальных переопределений. Реальные секреты добавлять в него нельзя.
 
-Для OpenAI режима создайте локальный `.env` или задайте переменные окружения:
+Для включения OpenAI задайте переменные окружения или создайте локальный `.env`:
 
 ```env
 AI_PROVIDER=openai
@@ -188,37 +186,37 @@ OPENAI_API_KEY=<your-key>
 OPENAI_MODEL=gpt-4.1
 ```
 
-Затем перезапустите Compose:
+После этого перезапустите Docker Compose:
 
 ```bash
 docker compose down
 docker compose up --build
 ```
 
-При `AI_PROVIDER=openai` без `OPENAI_API_KEY` приложение откажется запускаться. Fake default для ключа не задан.
+Если задано `AI_PROVIDER=openai`, но отсутствует `OPENAI_API_KEY`, приложение завершит запуск с ошибкой конфигурации. Подставного значения для ключа нет.
 
 ## API
 
-| Method | Endpoint | Auth | Назначение |
+| Метод | Endpoint | Доступ | Назначение |
 | --- | --- | --- | --- |
-| `POST` | `/api/auth/login` | public | Получить JWT |
-| `POST` | `/api/claims` | public | Создать multipart claim, ответ `202` |
-| `GET` | `/api/claims/{id}/status` | public | Получить id и status |
-| `GET` | `/api/admin/claims` | `ADMIN` JWT | Список заявок |
-| `GET` | `/api/admin/claims/{id}` | `ADMIN` JWT | Детали и analysis result |
+| `POST` | `/api/auth/login` | публичный | Получить JWT |
+| `POST` | `/api/claims` | публичный | Создать заявку, ответ `202` |
+| `GET` | `/api/claims/{id}/status` | публичный | Получить идентификатор и статус заявки |
+| `GET` | `/api/admin/claims` | JWT с ролью `ADMIN` | Получить список заявок |
+| `GET` | `/api/admin/claims/{id}` | JWT с ролью `ADMIN` | Получить заявку и результат анализа |
 
-Для создания claim используются multipart-поля:
+Для создания заявки используются multipart-поля:
 
 - `carBrand`;
 - `carModel`;
 - `carYear`;
-- `images` - от 1 до 3 JPEG/PNG-файлов.
+- `images` - от 1 до 3 файлов JPEG или PNG.
 
-Полный интерактивный контракт доступен в Swagger UI. Admin detail содержит vehicle data, failure reason, analysis, findings и confidence.
+Полное описание запроса и ответов доступно в Swagger UI. Ответ администратора содержит данные автомобиля, причину ошибки при наличии, результат анализа, найденные повреждения и значение `confidence`.
 
 ## Проверка качества
 
-Локальные команды из корня репозитория:
+Команды для проверки из корня репозитория:
 
 ```bash
 ./gradlew cleanTest test
@@ -228,17 +226,17 @@ docker compose config
 
 В Windows используйте `gradlew.bat` вместо `./gradlew`.
 
-CI запускает `cleanTest build`, проверяет Compose config и собирает Docker image.
+CI запускает `cleanTest build`, проверяет конфигурацию Docker Compose и собирает образ Docker.
 
-## Backend-решения и ограничения
+## Ограничения и компромиссы
 
-- Kafka используется как asynchronous boundary внутри одного deployable; отдельные микросервисы не добавляются.
+- Kafka используется как асинхронная граница внутри одного приложения; отдельные микросервисы не добавляются.
 - Transactional Outbox и DLT намеренно не реализованы.
-- DB commit и Kafka publish разделены, поэтому после commit сохраняется crash window до публикации события.
-- AI calls имеют at-least-once semantics при реальном process crash.
-- Owner lease защищает overlap при Kafka stop/rebalance/redelivery, но не является general distributed scheduler.
-- Pricing, frontend, email, DOCX и XLSX в Java-версии не реализованы.
+- Транзакция БД и публикация в Kafka разделены, поэтому после фиксации БД остаётся промежуток, в котором процесс может завершиться до публикации события.
+- После полного падения процесса запрос к OpenAI может быть выполнен повторно.
+- Владелец и время действия права на обработку защищают от наложения обработчиков при остановке или перераспределении Kafka, но не являются универсальным планировщиком распределённых задач.
+- Расчёт стоимости, пользовательский интерфейс, электронная почта, DOCX и XLSX в Java-версии не реализованы.
 
 ## Статус проекта
 
-Функциональный Java backend завершён: claims API, JWT admin API, Kafka-driven analysis, mock/OpenAI boundary, atomic result persistence, OpenAPI documentation и Docker Compose startup включены в репозиторий.
+Функциональная Java-версия завершена: в репозитории есть API заявок, JWT-аутентификация администратора, обработка через Kafka, mock/OpenAI-анализ, атомарное сохранение результата, OpenAPI-документация и запуск через Docker Compose.
