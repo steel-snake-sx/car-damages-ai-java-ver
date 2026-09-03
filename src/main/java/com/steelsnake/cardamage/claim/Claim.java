@@ -13,6 +13,15 @@ public record Claim(
 		String carModel,
 		int carYear,
 		ClaimStatus status,
+		// заполняется только вместе с ANALYSIS_FAILED
+		AnalysisFailureReason analysisFailureReason,
+		UUID analysisOwnerToken,
+		Instant analysisLeaseUntil,
 		Instant createdAt,
 		Instant updatedAt) {
+
+	static Claim pending(String carBrand, String carModel, int carYear, Instant now) {
+		return new Claim(null, carBrand, carModel, carYear, ClaimStatus.ANALYSIS_PENDING,
+				null, null, null, now, now);
+	}
 }

@@ -57,6 +57,8 @@ class ClaimServiceTests {
 
 	private ClaimRepository claimRepository;
 	private ClaimImageRepository imageRepository;
+	private ClaimAnalysisRepository analysisRepository;
+	private ClaimAnalysisFindingRepository findingRepository;
 	private TestTransactionManager transactionManager;
 	private KafkaTemplate<String, DamageAnalysisRequested> kafkaTemplate;
 	private ClaimService service;
@@ -66,11 +68,15 @@ class ClaimServiceTests {
 	void configureService() {
 		this.claimRepository = mock(ClaimRepository.class);
 		this.imageRepository = mock(ClaimImageRepository.class);
+		this.analysisRepository = mock(ClaimAnalysisRepository.class);
+		this.findingRepository = mock(ClaimAnalysisFindingRepository.class);
 		this.transactionManager = new TestTransactionManager();
 		this.kafkaTemplate = mock(KafkaTemplate.class);
 		this.service = new ClaimService(
 				this.claimRepository,
 				this.imageRepository,
+				this.analysisRepository,
+				this.findingRepository,
 				new ImageStorage(this.temporaryDirectory.toString()),
 				TransactionalOperator.create(this.transactionManager),
 				this.kafkaTemplate);
@@ -167,21 +173,69 @@ class ClaimServiceTests {
 	}
 
 	@Test
-	void startAnalysisTransitionsEligibleClaimAndIgnoresRedelivery() {
+	void adminDetailExposesTheStoredAnalysisResult() {
 		UUID claimId = UUID.randomUUID();
-		when(this.claimRepository.startAnalysis(eq(claimId), any(Instant.class)))
-				.thenReturn(Mono.just(1L))
-				.thenReturn(Mono.just(0L));
+		Instant now = Instant.now();
+		when(this.claimRepository.findById(claimId)).thenReturn(Mono.just(new Claim(
+				claimId, "Toyota", "Camry", 2022, ClaimStatus.ANALYZED, null, null, null, now, now)));
+		when(this.analysisRepository.findByClaimId(claimId)).thenReturn(Mono.just(new ClaimAnalysis(
+				UUID.randomUUID(), claimId, true, "Повреждена передняя часть", 0.9, now)));
+		when(this.findingRepository.findAllByClaimIdOrderByPosition(claimId))
+				.thenReturn(reactor.core.publisher.Flux.just(new ClaimAnalysisFinding(
+						UUID.randomUUID(), claimId, (short) 0, "Передний бампер", "Царапины",
+						DamageSeverity.MEDIUM, 0.87)));
 
-		StepVerifier.create(this.service.startAnalysis(claimId))
+		StepVerifier.create(this.service.getAdminClaim(claimId))
+				.assertNext(details -> {
+					assertThat(details.status()).isEqualTo(ClaimStatus.ANALYZED);
+					assertThat(details.analysis()).isNotNull();
+					assertThat(details.analysis().summary()).isEqualTo("Повреждена передняя часть");
+					assertThat(details.analysis().findings()).containsExactly(new AdminClaimDetails.Finding(
+							"Передний бампер", "Царапины", DamageSeverity.MEDIUM, 0.87));
+				})
 				.expectComplete()
 				.verify(Duration.ofSeconds(1));
-		StepVerifier.create(this.service.startAnalysis(claimId))
+	}
+
+	@Test
+	void adminDetailDoesNotAttachAnalysisToAnalyzingSnapshot() {
+		UUID claimId = UUID.randomUUID();
+		Instant now = Instant.now();
+		when(this.claimRepository.findById(claimId)).thenReturn(Mono.just(new Claim(
+				claimId, "Toyota", "Camry", 2022, ClaimStatus.ANALYZING, null, null, null, now, now)));
+		when(this.analysisRepository.findByClaimId(claimId)).thenReturn(Mono.just(new ClaimAnalysis(
+				UUID.randomUUID(), claimId, true, "Повреждена передняя часть", 0.9, now)));
+
+		StepVerifier.create(this.service.getAdminClaim(claimId))
+				.assertNext(details -> {
+					assertThat(details.status()).isEqualTo(ClaimStatus.ANALYZING);
+					assertThat(details.analysis()).isNull();
+				})
 				.expectComplete()
 				.verify(Duration.ofSeconds(1));
 
-		verify(this.claimRepository, times(2)).startAnalysis(eq(claimId), any(Instant.class));
-		verifyNoInteractions(this.imageRepository);
+		verifyNoInteractions(this.analysisRepository, this.findingRepository);
+	}
+
+	@Test
+	void adminDetailOmitsAnalysisWhileItIsMissing() {
+		UUID claimId = UUID.randomUUID();
+		Instant now = Instant.now();
+		when(this.claimRepository.findById(claimId)).thenReturn(Mono.just(new Claim(
+				claimId, "Toyota", "Camry", 2022, ClaimStatus.ANALYSIS_FAILED,
+				AnalysisFailureReason.AI_UNAVAILABLE, null, null, now, now)));
+		when(this.analysisRepository.findByClaimId(claimId)).thenReturn(Mono.empty());
+
+		StepVerifier.create(this.service.getAdminClaim(claimId))
+				.assertNext(details -> {
+					assertThat(details.analysis()).isNull();
+					assertThat(details.analysisFailureReason())
+							.isEqualTo(AnalysisFailureReason.AI_UNAVAILABLE);
+				})
+				.expectComplete()
+				.verify(Duration.ofSeconds(1));
+
+		verifyNoInteractions(this.findingRepository);
 	}
 
 	@Test
@@ -269,7 +323,7 @@ class ClaimServiceTests {
 		UUID claimId = UUID.randomUUID();
 		Instant now = Instant.now();
 		when(this.claimRepository.findById(claimId)).thenReturn(Mono.just(new Claim(
-				claimId, "Toyota", "Camry", 2022, ClaimStatus.ANALYSIS_PENDING, now, now)));
+				claimId, "Toyota", "Camry", 2022, ClaimStatus.ANALYSIS_PENDING, null, null, null, now, now)));
 
 		StepVerifier.create(this.service.getStatus(claimId))
 				.assertNext(status -> assertThat(status)
@@ -330,6 +384,7 @@ class ClaimServiceTests {
 			Claim claim = invocation.getArgument(0);
 			return Mono.just(new Claim(
 					claimId, claim.carBrand(), claim.carModel(), claim.carYear(), claim.status(),
+					claim.analysisFailureReason(), claim.analysisOwnerToken(), claim.analysisLeaseUntil(),
 					claim.createdAt(), claim.updatedAt()));
 		});
 		return claimId;

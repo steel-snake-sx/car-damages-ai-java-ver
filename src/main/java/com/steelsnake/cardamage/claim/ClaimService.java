@@ -26,6 +26,8 @@ public class ClaimService {
 
 	private final ClaimRepository claimRepository;
 	private final ClaimImageRepository claimImageRepository;
+	private final ClaimAnalysisRepository claimAnalysisRepository;
+	private final ClaimAnalysisFindingRepository claimAnalysisFindingRepository;
 	private final ImageStorage imageStorage;
 	private final TransactionalOperator transactionalOperator;
 	private final KafkaTemplate<String, DamageAnalysisRequested> kafkaTemplate;
@@ -33,11 +35,15 @@ public class ClaimService {
 	ClaimService(
 			ClaimRepository claimRepository,
 			ClaimImageRepository claimImageRepository,
+			ClaimAnalysisRepository claimAnalysisRepository,
+			ClaimAnalysisFindingRepository claimAnalysisFindingRepository,
 			ImageStorage imageStorage,
 			TransactionalOperator transactionalOperator,
 			KafkaTemplate<String, DamageAnalysisRequested> kafkaTemplate) {
 		this.claimRepository = claimRepository;
 		this.claimImageRepository = claimImageRepository;
+		this.claimAnalysisRepository = claimAnalysisRepository;
+		this.claimAnalysisFindingRepository = claimAnalysisFindingRepository;
 		this.imageStorage = imageStorage;
 		this.transactionalOperator = transactionalOperator;
 		this.kafkaTemplate = kafkaTemplate;
@@ -80,20 +86,20 @@ public class ClaimService {
 
 	public Mono<AdminClaimDetails> getAdminClaim(UUID claimId) {
 		return this.claimRepository.findById(claimId)
-				.map(AdminClaimDetails::from)
+				.flatMap(claim -> claim.status() == ClaimStatus.ANALYZED
+						? analysisDetails(claim.id())
+								.map(analysis -> AdminClaimDetails.from(claim, analysis))
+								.defaultIfEmpty(AdminClaimDetails.from(claim, null))
+						: Mono.just(AdminClaimDetails.from(claim, null)))
 				.switchIfEmpty(Mono.error(ClaimApiException.notFound()));
 	}
 
-	public Mono<Void> startAnalysis(UUID claimId) {
-		return this.claimRepository.startAnalysis(claimId, Instant.now())
-				.doOnNext(updated -> {
-					if (updated == 0) {
-						logger.info(
-								"Skipping analysis request for claim {}: not ANALYSIS_PENDING or missing",
-								claimId);
-					}
-				})
-				.then();
+	private Mono<AdminClaimDetails.Analysis> analysisDetails(UUID claimId) {
+		return this.claimAnalysisRepository.findByClaimId(claimId)
+				.flatMap(analysis -> this.claimAnalysisFindingRepository
+						.findAllByClaimIdOrderByPosition(claimId)
+						.collectList()
+						.map(findings -> AdminClaimDetails.Analysis.from(analysis, findings)));
 	}
 
 	private Mono<Void> publishAnalysisRequest(UUID claimId) {
@@ -114,7 +120,7 @@ public class ClaimService {
 	private Mono<ClaimStatusResponse> saveClaim(
 			String brand, String model, int year, ImageStorage.ImageBatch batch) {
 		Instant now = Instant.now();
-		Claim claim = new Claim(null, brand, model, year, ClaimStatus.ANALYSIS_PENDING, now, now);
+		Claim claim = Claim.pending(brand, model, year, now);
 
 		Mono<ClaimStatusResponse> save = registerImageCleanup(batch)
 				.then(this.claimRepository.save(claim))

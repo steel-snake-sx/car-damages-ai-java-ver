@@ -41,6 +41,7 @@ import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
 import org.springframework.kafka.core.DefaultKafkaProducerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.listener.MessageListenerContainer;
+import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -49,24 +50,36 @@ import org.springframework.test.web.reactive.server.WebTestClient;
 import org.springframework.web.reactive.function.BodyInserters;
 
 import com.steelsnake.cardamage.auth.AdminUserRepository;
+import com.steelsnake.cardamage.auth.LoginResponse;
+import com.steelsnake.cardamage.claim.AnalysisFailureReason;
 import com.steelsnake.cardamage.claim.Claim;
+import com.steelsnake.cardamage.claim.ClaimAnalysisFindingRepository;
+import com.steelsnake.cardamage.claim.ClaimAnalysisRepository;
+import com.steelsnake.cardamage.claim.ClaimAnalysisService;
 import com.steelsnake.cardamage.claim.ClaimImage;
 import com.steelsnake.cardamage.claim.ClaimImageRepository;
 import com.steelsnake.cardamage.claim.ClaimRepository;
-import com.steelsnake.cardamage.claim.ClaimService;
 import com.steelsnake.cardamage.claim.ClaimStatus;
 import com.steelsnake.cardamage.claim.ClaimStatusResponse;
+import com.steelsnake.cardamage.claim.DamageAnalysis;
+import com.steelsnake.cardamage.claim.DamageAnalysisException;
 import com.steelsnake.cardamage.claim.DamageAnalysisRequested;
+import com.steelsnake.cardamage.claim.DamageAnalyzer;
+import com.steelsnake.cardamage.claim.DamageFinding;
+import com.steelsnake.cardamage.claim.DamageSeverity;
 import com.steelsnake.cardamage.claim.ImageStorage;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Sinks;
 import reactor.test.StepVerifier;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 @Testcontainers(disabledWithoutDocker = true)
 @SpringBootTest
@@ -91,6 +104,10 @@ class CarDamageApplicationTests {
 	@Autowired
 	private ClaimImageRepository claimImageRepository;
 	@Autowired
+	private ClaimAnalysisRepository claimAnalysisRepository;
+	@Autowired
+	private ClaimAnalysisFindingRepository claimAnalysisFindingRepository;
+	@Autowired
 	private AdminUserRepository adminUserRepository;
 	@Autowired
 	private PasswordEncoder passwordEncoder;
@@ -100,8 +117,12 @@ class CarDamageApplicationTests {
 	private KafkaTemplate<String, DamageAnalysisRequested> kafkaTemplate;
 	@Autowired
 	private KafkaListenerEndpointRegistry listenerRegistry;
+	@Autowired
+	private DatabaseClient databaseClient;
 	@MockitoSpyBean
-	private ClaimService claimService;
+	private ClaimAnalysisService claimAnalysisService;
+	@MockitoSpyBean
+	private DamageAnalyzer damageAnalyzer;
 
 	private WebTestClient webTestClient;
 
@@ -124,7 +145,8 @@ class CarDamageApplicationTests {
 	@Test
 	void repositoriesPersistClaimsAndImages() {
 		Instant now = Instant.now();
-		Claim newClaim = new Claim(null, "Toyota", "Camry", 2022, ClaimStatus.ANALYSIS_PENDING, now, now);
+		Claim newClaim = new Claim(
+				null, "Toyota", "Camry", 2022, ClaimStatus.ANALYSIS_PENDING, null, null, null, now, now);
 
 		Mono<PersistedData> persistedData = this.claimRepository.save(newClaim)
 				.flatMap(savedClaim -> this.claimImageRepository.save(new ClaimImage(
@@ -214,34 +236,173 @@ class CarDamageApplicationTests {
 	}
 
 	@Test
-	void publishedAnalysisRequestTransitionsClaimToAnalyzing() throws Exception {
+	void publishedAnalysisRequestStoresTheAnalysisResult() throws Exception {
 		UUID claimId = submitClaim();
 
-		Claim analyzing = awaitStatus(claimId, ClaimStatus.ANALYZING);
+		Claim analyzed = awaitStatus(claimId, ClaimStatus.ANALYZED);
 
-		assertThat(analyzing.status()).isEqualTo(ClaimStatus.ANALYZING);
-		assertThat(analyzing.updatedAt()).isAfterOrEqualTo(analyzing.createdAt());
+		assertThat(analyzed.analysisFailureReason()).isNull();
+		assertThat(analyzed.updatedAt()).isAfterOrEqualTo(analyzed.createdAt());
+		StepVerifier.create(this.claimAnalysisRepository.findByClaimId(claimId))
+				.assertNext(analysis -> {
+					assertThat(analysis.carDetected()).isTrue();
+					assertThat(analysis.summary()).isNotBlank();
+				})
+				.expectComplete()
+				.verify(Duration.ofSeconds(10));
+		StepVerifier.create(this.claimAnalysisFindingRepository.findAllByClaimIdOrderByPosition(claimId))
+				.assertNext(finding -> assertThat(finding.position()).isZero())
+				.assertNext(finding -> assertThat(finding.position()).isEqualTo((short) 1))
+				.expectComplete()
+				.verify(Duration.ofSeconds(10));
 	}
 
 	@Test
-	void redeliveredAnalysisRequestDoesNotRepeatProcessing() throws Exception {
+	void adminDetailExposesTheAnalysisResult() throws Exception {
 		UUID claimId = submitClaim();
-		Claim analyzing = awaitStatus(claimId, ClaimStatus.ANALYZING);
+		awaitStatus(claimId, ClaimStatus.ANALYZED);
 
-		var redelivered = this.kafkaTemplate.send(
-						DamageAnalysisRequested.TOPIC,
-						claimId.toString(),
-						new DamageAnalysisRequested(DamageAnalysisRequested.VERSION, claimId))
-				.get(10, TimeUnit.SECONDS);
-		awaitCommittedOffset(
-				new TopicPartition(
-						redelivered.getRecordMetadata().topic(), redelivered.getRecordMetadata().partition()),
-				redelivered.getRecordMetadata().offset() + 1);
+		this.webTestClient.get()
+				.uri("/api/admin/claims/{id}", claimId)
+				.headers(headers -> headers.setBearerAuth(adminToken()))
+				.exchange()
+				.expectStatus().isOk()
+				.expectBody()
+				.jsonPath("$.status").isEqualTo("ANALYZED")
+				.jsonPath("$.analysis.carDetected").isEqualTo(true)
+				.jsonPath("$.analysis.findings[0].severity").isEqualTo("MEDIUM");
+
+		this.webTestClient.get()
+				.uri("/api/claims/{id}/status", claimId)
+				.exchange()
+				.expectStatus().isOk()
+				.expectBody()
+				.jsonPath("$.status").isEqualTo("ANALYZED")
+				.jsonPath("$.analysis").doesNotExist()
+				.jsonPath("$.carBrand").doesNotExist();
+	}
+
+	@Test
+	void redeliveredAnalysisRequestDoesNotRepeatTerminalProcessing() throws Exception {
+		UUID claimId = submitClaim();
+		Claim analyzed = awaitStatus(claimId, ClaimStatus.ANALYZED);
+		clearInvocations(this.damageAnalyzer);
+
+		sendAndAwaitCommit(claimId);
 
 		Claim afterRedelivery = this.claimRepository.findById(claimId).block(Duration.ofSeconds(10));
 		assertThat(afterRedelivery).isNotNull();
-		assertThat(afterRedelivery.status()).isEqualTo(ClaimStatus.ANALYZING);
-		assertThat(afterRedelivery.updatedAt()).isEqualTo(analyzing.updatedAt());
+		assertThat(afterRedelivery.status()).isEqualTo(ClaimStatus.ANALYZED);
+		assertThat(afterRedelivery.updatedAt()).isEqualTo(analyzed.updatedAt());
+		verifyNoInteractions(this.damageAnalyzer);
+	}
+
+	@Test
+	void redeliveryFromAnalyzingResumesTheUnfinishedAnalysis() throws Exception {
+		Claim analyzing = saveClaimWithImage(ClaimStatus.ANALYZING);
+
+		sendAndAwaitCommit(analyzing.id());
+
+		assertThat(awaitStatus(analyzing.id(), ClaimStatus.ANALYZED).status())
+				.isEqualTo(ClaimStatus.ANALYZED);
+		StepVerifier.create(this.claimAnalysisRepository.findByClaimId(analyzing.id()))
+				.expectNextCount(1)
+				.expectComplete()
+				.verify(Duration.ofSeconds(10));
+	}
+
+	@Test
+	void resultTransactionRollsBackWhenOwnershipIsLostBeforeFinalTransition() throws Exception {
+		Claim analyzing = saveClaimWithImage(ClaimStatus.ANALYZING);
+		clearInvocations(this.damageAnalyzer);
+		CountDownLatch analyzerStarted = new CountDownLatch(1);
+		Sinks.One<DamageAnalysis> analysisResult = Sinks.one();
+		doAnswer(invocation -> {
+			analyzerStarted.countDown();
+			return analysisResult.asMono();
+		}).when(this.damageAnalyzer).analyze(anyList());
+
+		StepVerifier.create(this.claimAnalysisService.analyze(analyzing.id()))
+				.then(() -> {
+					assertThat(await(analyzerStarted)).isTrue();
+					executeSql(("UPDATE claims SET analysis_owner_token = '%s', "
+							+ "analysis_lease_until = now() + interval '10 minutes' WHERE id = '%s'")
+							.formatted(UUID.randomUUID(), analyzing.id()));
+					assertThat(analysisResult.tryEmitValue(
+							new DamageAnalysis(true, "Повреждения есть", 0.9, java.util.List.of(
+									new DamageFinding("Бампер", "Царапины", DamageSeverity.LOW, 0.8)))))
+							.isEqualTo(Sinks.EmitResult.OK);
+				})
+				.expectError(IllegalStateException.class)
+				.verify(Duration.ofSeconds(10));
+
+		StepVerifier.create(Mono.zip(
+					this.claimRepository.findById(analyzing.id()),
+					this.claimAnalysisRepository.findByClaimId(analyzing.id()).hasElement(),
+					this.claimAnalysisFindingRepository
+							.findAllByClaimIdOrderByPosition(analyzing.id())
+							.hasElements()))
+				.assertNext(state -> {
+					assertThat(state.getT1().status()).isEqualTo(ClaimStatus.ANALYZING);
+					assertThat(state.getT2()).isFalse();
+					assertThat(state.getT3()).isFalse();
+				})
+				.expectComplete()
+				.verify(Duration.ofSeconds(10));
+		verify(this.damageAnalyzer, times(1)).analyze(anyList());
+	}
+
+	@Test
+	void postgresqlOwnershipGuardsActiveAndStaleWorkers() throws Exception {
+		Claim pending = saveClaimWithImage(ClaimStatus.ANALYSIS_PENDING);
+		Instant now = Instant.now();
+		UUID ownerA = UUID.randomUUID();
+		UUID ownerB = UUID.randomUUID();
+
+		assertThat(this.claimRepository.acquireAnalysis(
+				pending.id(), ownerA, now.plusSeconds(600), now, now).block(Duration.ofSeconds(10)))
+				.isEqualTo(1L);
+		assertThat(this.claimRepository.acquireAnalysis(
+				pending.id(), ownerB, now.plusSeconds(600), now, now).block(Duration.ofSeconds(10)))
+				.isEqualTo(0L);
+
+		executeSql("UPDATE claims SET analysis_lease_until = now() - interval '1 second' WHERE id = '%s'"
+				.formatted(pending.id()));
+		Instant resumedAt = Instant.now();
+		assertThat(this.claimRepository.acquireAnalysis(
+				pending.id(), ownerB, resumedAt.plusSeconds(600), resumedAt, resumedAt)
+				.block(Duration.ofSeconds(10))).isEqualTo(1L);
+		assertThat(this.claimRepository.completeAnalysis(
+				pending.id(), ownerA, resumedAt, resumedAt).block(Duration.ofSeconds(10)))
+				.isEqualTo(0L);
+		assertThat(this.claimRepository.completeAnalysis(
+				pending.id(), ownerB, resumedAt, resumedAt).block(Duration.ofSeconds(10)))
+				.isEqualTo(1L);
+		assertThat(this.claimRepository.acquireAnalysis(
+				pending.id(), UUID.randomUUID(), resumedAt.plusSeconds(600), resumedAt, resumedAt)
+				.block(Duration.ofSeconds(10))).isEqualTo(0L);
+
+		Claim terminal = this.claimRepository.findById(pending.id()).block(Duration.ofSeconds(10));
+		assertThat(terminal).isNotNull();
+		assertThat(terminal.status()).isEqualTo(ClaimStatus.ANALYZED);
+		assertThat(terminal.analysisOwnerToken()).isNull();
+		assertThat(terminal.analysisLeaseUntil()).isNull();
+	}
+
+	@Test
+	void permanentAnalyzerFailureRecordsTerminalFailureAndCompletesProcessing() throws Exception {
+		Claim pending = saveClaimWithImage(ClaimStatus.ANALYSIS_PENDING);
+		doReturn(Mono.error(DamageAnalysisException.unavailable("AI is down", null)))
+				.when(this.damageAnalyzer).analyze(anyList());
+
+		long offsetAfterRecord = sendAndAwaitCommit(pending.id());
+
+		Claim failed = awaitStatus(pending.id(), ClaimStatus.ANALYSIS_FAILED);
+		assertThat(failed.analysisFailureReason()).isEqualTo(AnalysisFailureReason.AI_UNAVAILABLE);
+		assertThat(committedOffset(analysisPartition())).isGreaterThanOrEqualTo(offsetAfterRecord);
+		StepVerifier.create(this.claimAnalysisRepository.findByClaimId(pending.id()))
+				.expectComplete()
+				.verify(Duration.ofSeconds(10));
 	}
 
 	@Test
@@ -278,7 +439,7 @@ class CarDamageApplicationTests {
 
 			UUID claimId = submitClaim();
 
-			assertThat(awaitStatus(claimId, ClaimStatus.ANALYZING).status()).isEqualTo(ClaimStatus.ANALYZING);
+			assertThat(awaitStatus(claimId, ClaimStatus.ANALYZED).status()).isEqualTo(ClaimStatus.ANALYZED);
 		}
 		finally {
 			if (!container.isRunning()) {
@@ -289,39 +450,21 @@ class CarDamageApplicationTests {
 
 	@Test
 	void temporaryPersistenceFailureIsRetriedAndUltimatelyProcessed() throws Exception {
-		Claim pending = savePendingClaim("Toyota", "Camry", 2022);
+		Claim pending = saveClaimWithImage(ClaimStatus.ANALYSIS_PENDING);
 		doReturn(Mono.error(new TransientDataAccessResourceException("database is down")))
 				.doCallRealMethod()
-				.when(this.claimService).startAnalysis(pending.id());
+				.when(this.claimAnalysisService).analyze(pending.id());
 
-		this.kafkaTemplate.send(
-						DamageAnalysisRequested.TOPIC,
-						pending.id().toString(),
-						new DamageAnalysisRequested(DamageAnalysisRequested.VERSION, pending.id()))
-				.get(10, TimeUnit.SECONDS);
+		sendAndAwaitCommit(pending.id());
 
-		assertThat(awaitStatus(pending.id(), ClaimStatus.ANALYZING).status())
-				.isEqualTo(ClaimStatus.ANALYZING);
-		verify(this.claimService, times(2)).startAnalysis(pending.id());
-
-		Claim followUp = savePendingClaim("Honda", "Civic", 2023);
-		var followUpSent = this.kafkaTemplate.send(
-						DamageAnalysisRequested.TOPIC,
-						followUp.id().toString(),
-						new DamageAnalysisRequested(DamageAnalysisRequested.VERSION, followUp.id()))
-				.get(10, TimeUnit.SECONDS);
-
-		assertThat(awaitStatus(followUp.id(), ClaimStatus.ANALYZING).status())
-				.isEqualTo(ClaimStatus.ANALYZING);
-		awaitCommittedOffset(
-				new TopicPartition(
-						followUpSent.getRecordMetadata().topic(), followUpSent.getRecordMetadata().partition()),
-				followUpSent.getRecordMetadata().offset() + 1);
+		assertThat(awaitStatus(pending.id(), ClaimStatus.ANALYZED).status())
+				.isEqualTo(ClaimStatus.ANALYZED);
+		verify(this.claimAnalysisService, times(2)).analyze(pending.id());
 	}
 
 	@Test
 	void persistenceFailureKeepsRecordRedeliverableAcrossListenerRestart() throws Exception {
-		Claim pending = savePendingClaim("Toyota", "Corolla", 2021);
+		Claim pending = saveClaimWithImage(ClaimStatus.ANALYSIS_PENDING);
 		CountDownLatch firstAttemptFailed = new CountDownLatch(1);
 		CountDownLatch oldAttemptParked = new CountDownLatch(1);
 		CountDownLatch postRestartDelivery = new CountDownLatch(1);
@@ -343,7 +486,7 @@ class CarDamageApplicationTests {
 				return invocation.callRealMethod();
 			}
 			return Mono.error(new IllegalStateException("processing resumed before persistence recovery"));
-		}).when(this.claimService).startAnalysis(pending.id());
+		}).when(this.claimAnalysisService).analyze(pending.id());
 
 		var sent = this.kafkaTemplate.send(
 						DamageAnalysisRequested.TOPIC,
@@ -369,8 +512,8 @@ class CarDamageApplicationTests {
 			assertThat(container.isRunning()).isTrue();
 
 			assertThat(postRestartDelivery.await(30, TimeUnit.SECONDS)).isTrue();
-			assertThat(awaitStatus(pending.id(), ClaimStatus.ANALYZING).status())
-					.isEqualTo(ClaimStatus.ANALYZING);
+			assertThat(awaitStatus(pending.id(), ClaimStatus.ANALYZED).status())
+					.isEqualTo(ClaimStatus.ANALYZED);
 			awaitCommittedOffset(partition, sent.getRecordMetadata().offset() + 1);
 		}
 		finally {
@@ -538,13 +681,50 @@ class CarDamageApplicationTests {
 		throw new AssertionError("Claim " + claimId + " did not reach " + expected);
 	}
 
-	private Claim savePendingClaim(String brand, String model, int year) {
+	private Claim saveClaimWithImage(ClaimStatus status) throws IOException {
 		Instant now = Instant.now();
-		Claim pending = this.claimRepository.save(new Claim(
-				null, brand, model, year, ClaimStatus.ANALYSIS_PENDING, now, now))
+		Claim claim = this.claimRepository.save(new Claim(
+						null, "Toyota", "Camry", 2022, status, null, null, null, now, now))
 				.block(Duration.ofSeconds(10));
-		assertThat(pending).isNotNull();
-		return pending;
+		assertThat(claim).isNotNull();
+		Path directory = imageDirectory.resolve(claim.id().toString());
+		Files.createDirectories(directory);
+		Files.write(directory.resolve("damage.png"), createPng());
+		this.claimImageRepository.save(new ClaimImage(
+						null, claim.id(), claim.id() + "/damage.png", "damage.png", "image/png", 3, now))
+				.block(Duration.ofSeconds(10));
+		return claim;
+	}
+
+	private long sendAndAwaitCommit(UUID claimId) throws Exception {
+		var sent = this.kafkaTemplate.send(
+						DamageAnalysisRequested.TOPIC,
+						claimId.toString(),
+						new DamageAnalysisRequested(DamageAnalysisRequested.VERSION, claimId))
+				.get(10, TimeUnit.SECONDS);
+		long offsetAfterRecord = sent.getRecordMetadata().offset() + 1;
+		awaitCommittedOffset(analysisPartition(), offsetAfterRecord);
+		return offsetAfterRecord;
+	}
+
+	private void executeSql(String sql) {
+		this.databaseClient.sql(sql).then().block(Duration.ofSeconds(10));
+	}
+
+	private static TopicPartition analysisPartition() {
+		return new TopicPartition(DamageAnalysisRequested.TOPIC, 0);
+	}
+
+	private String adminToken() {
+		return this.webTestClient.post()
+				.uri("/api/auth/login")
+				.bodyValue(Map.of("email", "admin@integration.test", "password", adminPassword))
+				.exchange()
+				.expectStatus().isOk()
+				.expectBody(LoginResponse.class)
+				.returnResult()
+				.getResponseBody()
+				.accessToken();
 	}
 
 	private MessageListenerContainer analysisListenerContainer() {
@@ -608,6 +788,16 @@ class CarDamageApplicationTests {
 			throw new IllegalStateException("PNG writer is unavailable");
 		}
 		return output.toByteArray();
+	}
+
+	private static boolean await(CountDownLatch latch) {
+		try {
+			return latch.await(10, TimeUnit.SECONDS);
+		}
+		catch (InterruptedException exception) {
+			Thread.currentThread().interrupt();
+			throw new AssertionError("Interrupted while waiting for analysis", exception);
+		}
 	}
 
 	private static long countImageDirectories() throws IOException {

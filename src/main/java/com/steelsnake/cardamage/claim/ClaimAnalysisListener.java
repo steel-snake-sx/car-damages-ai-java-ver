@@ -18,13 +18,13 @@ class ClaimAnalysisListener {
 
 	private static final Logger logger = LoggerFactory.getLogger(ClaimAnalysisListener.class);
 
-	private final ClaimService claimService;
+	private final ClaimAnalysisService claimAnalysisService;
 	private final Duration processingRetryInterval;
 
 	ClaimAnalysisListener(
-			ClaimService claimService,
+			ClaimAnalysisService claimAnalysisService,
 			@Value("${app.kafka.analysis-retry-interval}") Duration processingRetryInterval) {
-		this.claimService = claimService;
+		this.claimAnalysisService = claimAnalysisService;
 		this.processingRetryInterval = processingRetryInterval;
 	}
 
@@ -42,17 +42,17 @@ class ClaimAnalysisListener {
 						event.claimId(), event.version());
 				return Mono.empty();
 			}
-			// при каждой попытке заново выполняем весь переход
-			return Mono.defer(() -> this.claimService.startAnalysis(event.claimId()))
+			// ошибка до сохранения исхода или потеря владения оставляет сообщение без подтверждения
+			return Mono.defer(() -> this.claimAnalysisService.analyze(event.claimId()))
 					.retryWhen(processingRetry(event.claimId()));
 		});
 	}
 
-	// валидная запись остаётся без ack, пока переход Stage 5 не завершится
+	// ошибки сохранения ретраятся внутри сервиса, остальные ошибки повторяют доставку
 	private Retry processingRetry(UUID claimId) {
 		return Retry.from(signals -> signals.concatMap(signal -> {
 			logger.warn(
-					"Retrying Stage 5 transition for claim {} after processing failed",
+					"Retrying analysis processing for claim {} after persistence failed",
 					claimId, signal.failure());
 			return Mono.delay(this.processingRetryInterval);
 		}));

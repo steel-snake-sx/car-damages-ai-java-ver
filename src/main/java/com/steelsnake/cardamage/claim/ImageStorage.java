@@ -106,6 +106,22 @@ public class ImageStorage {
 				: Mono.empty();
 	}
 
+	// байты нужны только на время запроса к AI, размер уже ограничен MAX_IMAGE_SIZE_BYTES
+	Mono<byte[]> readImage(String storagePath) {
+		return Mono.fromCallable(() -> {
+			Path path = this.rootDirectory.resolve(storagePath).normalize();
+			if (!path.startsWith(this.rootDirectory)) {
+				throw new IllegalArgumentException("Image path escapes the storage root: " + storagePath);
+			}
+			try {
+				return Files.readAllBytes(path);
+			}
+			catch (IOException exception) {
+				throw new UncheckedIOException(exception);
+			}
+		}).subscribeOn(Schedulers.boundedElastic());
+	}
+
 	Mono<Void> completeTransaction(ImageBatch batch, int status) {
 		if (status == TransactionSynchronization.STATUS_COMMITTED) {
 			batch.keepFiles();

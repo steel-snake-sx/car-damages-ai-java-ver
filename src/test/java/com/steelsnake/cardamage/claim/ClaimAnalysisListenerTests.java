@@ -20,31 +20,31 @@ import static org.mockito.Mockito.when;
 
 class ClaimAnalysisListenerTests {
 
-	private ClaimService claimService;
+	private ClaimAnalysisService claimAnalysisService;
 	private ClaimAnalysisListener listener;
 
 	@BeforeEach
 	void configureListener() {
-		this.claimService = mock(ClaimService.class);
-		this.listener = new ClaimAnalysisListener(this.claimService, Duration.ofMillis(10));
+		this.claimAnalysisService = mock(ClaimAnalysisService.class);
+		this.listener = new ClaimAnalysisListener(this.claimAnalysisService, Duration.ofMillis(10));
 	}
 
 	@Test
 	void supportedEventStartsAnalysisOnce() {
 		UUID claimId = UUID.randomUUID();
-		when(this.claimService.startAnalysis(claimId)).thenReturn(Mono.empty());
+		when(this.claimAnalysisService.analyze(claimId)).thenReturn(Mono.empty());
 
 		StepVerifier.create(this.listener.onAnalysisRequested(DamageAnalysisRequested.of(claimId)))
 				.expectComplete()
 				.verify(Duration.ofSeconds(1));
 
-		verify(this.claimService, times(1)).startAnalysis(claimId);
+		verify(this.claimAnalysisService, times(1)).analyze(claimId);
 	}
 
 	@Test
 	void permanentProcessingFailureIsRetriedUntilTheTransitionSucceeds() {
 		UUID claimId = UUID.randomUUID();
-		when(this.claimService.startAnalysis(claimId))
+		when(this.claimAnalysisService.analyze(claimId))
 				.thenReturn(Mono.error(new DataIntegrityViolationException("invalid database state")))
 				.thenReturn(Mono.error(new DataIntegrityViolationException("invalid database state")))
 				.thenReturn(Mono.empty());
@@ -55,13 +55,13 @@ class ClaimAnalysisListenerTests {
 				.expectComplete()
 				.verify(Duration.ofSeconds(1));
 
-		verify(this.claimService, times(3)).startAnalysis(claimId);
+		verify(this.claimAnalysisService, times(3)).analyze(claimId);
 	}
 
 	@Test
 	void applicationFailureIsAlsoRetriedUntilTheTransitionSucceeds() {
 		UUID claimId = UUID.randomUUID();
-		when(this.claimService.startAnalysis(claimId))
+		when(this.claimAnalysisService.analyze(claimId))
 				.thenReturn(Mono.error(new IllegalStateException("unexpected failure")))
 				.thenReturn(Mono.empty());
 
@@ -71,7 +71,7 @@ class ClaimAnalysisListenerTests {
 				.expectComplete()
 				.verify(Duration.ofSeconds(1));
 
-		verify(this.claimService, times(2)).startAnalysis(claimId);
+		verify(this.claimAnalysisService, times(2)).analyze(claimId);
 	}
 
 	@Test
@@ -81,7 +81,7 @@ class ClaimAnalysisListenerTests {
 				.expectComplete()
 				.verify(Duration.ofSeconds(1));
 
-		verifyNoInteractions(this.claimService);
+		verifyNoInteractions(this.claimAnalysisService);
 	}
 
 	@Test
@@ -91,17 +91,16 @@ class ClaimAnalysisListenerTests {
 				.expectComplete()
 				.verify(Duration.ofSeconds(1));
 
-		verifyNoInteractions(this.claimService);
+		verifyNoInteractions(this.claimAnalysisService);
 	}
 
 	@Test
 	void listenerDoesNotSubscribeBeforeItIsReturned() {
 		UUID claimId = UUID.randomUUID();
-		when(this.claimService.startAnalysis(any(UUID.class))).thenReturn(Mono.empty());
+		when(this.claimAnalysisService.analyze(any(UUID.class))).thenReturn(Mono.empty());
 
 		this.listener.onAnalysisRequested(DamageAnalysisRequested.of(claimId));
 
-		// подпиской и ack управляет контейнер
-		verifyNoInteractions(this.claimService);
+		verifyNoInteractions(this.claimAnalysisService);
 	}
 }
